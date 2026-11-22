@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID, createHash } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createRequire } from "node:module";
-import { openSync } from "node:fs";
 import { readdir, readFile, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -26,21 +25,23 @@ import WebSocket from "ws";
 // the restart. The throwaway project is deleted afterwards.
 // Env overrides: OMP_BUILDER_API, OMP_BUILDER_DB, OMP_BUILDER_PROJECTS_ROOT,
 // OMP_BUILDER_PREVIEW_ROOT, OMP_BUILDER_REPO.
-// NOTE: the restart check restarts the whole `npm run dev` (concurrently),
+// NOTE: the restart check restarts the whole service with
+// `systemctl restart omp-builder` (Phase 3.5 §2: the API + web run as the
+// omp-builder service user under one systemd unit running `npm run dev`),
 // so the web dev server (5173) restarts too; both must come back healthy.
+// Logs go to the journal, not a restart log file.
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
 
 const api = process.env.OMP_BUILDER_API ?? "http://127.0.0.1:8787";
-const dbPath = process.env.OMP_BUILDER_DB ?? "/root/projects/omp-builder/data/persistent/app.db";
-const projectsRoot = process.env.OMP_BUILDER_PROJECTS_ROOT ?? "/root/projects/omp-builder/data/projects";
+const dbPath = process.env.OMP_BUILDER_DB ?? "/var/lib/omp-builder/data/persistent/app.db";
+const projectsRoot = process.env.OMP_BUILDER_PROJECTS_ROOT ?? "/var/lib/omp-builder/data/projects";
 const previewRoot = process.env.OMP_BUILDER_PREVIEW_ROOT ?? "/var/lib/omp-builder/previews";
-const repoRoot = process.env.OMP_BUILDER_REPO ?? "/root/projects/omp-builder";
+const repoRoot = process.env.OMP_BUILDER_REPO ?? "/opt/omp-builder";
 const ADMIN_ID = "155e3283-d271-452a-af52-e90f900cd78d";
 const PHASE2_ID = "134cc3fe-631f-4755-9839-67af3bfd8ba9";
 const GUA_ID = "4f75505f-a2d9-4cc9-b6f8-4e3978c6de9b";
-const RESTART_LOG = "/tmp/phase3e-api-restart.log";
 
 const execFileAsync = promisify(execFile);
 const db = new Database(dbPath);
@@ -93,6 +94,12 @@ async function waitFor(predicate, timeoutMs, label) {
       if (await predicate()) return;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
+      // Phase 3.5 (§5 fix): a server-sent error frame (e.g. "OMP process
+      // limit reached") names the cause the moment it arrives — fail fast
+      // instead of burning the whole timeout and reporting a bare timeout.
+      if (lastError.startsWith("OMP session failed over WS:")) {
+        throw new Error(`timeout waiting for: ${label} (${lastError})`);
+      }
     }
     await sleep(2000);
   }
@@ -102,7 +109,7 @@ async function waitFor(predicate, timeoutMs, label) {
 async function podman(args, timeoutMs = 60_000) {
   // cwd "/" (mirroring the API, apps/api/src/preview.ts): podman fails to
   // resolve its working directory when spawned from a cwd the service user
-  // cannot traverse (e.g. the repo root under 0700 /root) — "cannot chdir".
+  // cannot traverse (e.g. a shell sitting under /root) — "cannot chdir".
   const result = await execFileAsync(
     "/usr/sbin/runuser",
     [
@@ -122,25 +129,6 @@ async function podman(args, timeoutMs = 60_000) {
     { cwd: "/", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
   );
   return result.stdout;
-}
-
-// Find PIDs whose /proc cmdline contains every needle (in-process scan, so
-// no shell pattern can match this script's own command line).
-async function findPidsByCmdline(needles) {
-  const found = [];
-  const entries = await readdir("/proc");
-  for (const entry of entries) {
-    if (!/^\d+$/.test(entry)) continue;
-    const pid = Number(entry);
-    if (pid === process.pid) continue;
-    try {
-      const cmdline = (await readFile(`/proc/${pid}/cmdline`)).toString().replace(/\0/g, " ");
-      if (needles.every((needle) => cmdline.includes(needle))) found.push(pid);
-    } catch {
-      // Process exited between readdir and read; ignore.
-    }
-  }
-  return found;
 }
 
 async function hashTree(rootDir) {
@@ -164,22 +152,22 @@ async function hashTree(rootDir) {
   return out;
 }
 
-// Relaunch `npm run dev` as a detached daemon WITHOUT a shell: `execFile`
-// on `bash -c "... &"` hangs forever, because `&` binds to the whole `&&`
-// chain, so the background subshell runs `npm run dev` in its FOREGROUND
-// and holds the execFile stdio pipes open (diagnosed 2026-11-22 — the
-// relaunch bash sat alive 9+ minutes). spawn with detached + unref +
-// stdio-to-a-log-file returns immediately and survives this process.
-function relaunchApi() {
-  const logFd = openSync(RESTART_LOG, "w");
-  const child = spawn("/root/.nvm/versions/node/v22.23.5/bin/npm", ["run", "dev"], {
-    cwd: repoRoot,
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-    env: { ...process.env, PATH: `/root/.nvm/versions/node/v22.23.5/bin:${process.env.PATH ?? ""}` },
-  });
-  child.unref();
-  return child.pid;
+// Restart the managed service (Phase 3.5 §2). Killing the concurrently
+// process directly would race the unit's Restart=on-failure on the same
+// port, so `systemctl restart` is the only restart path in this test.
+async function restartService() {
+  await execFileAsync("/usr/bin/systemctl", ["restart", "omp-builder.service"]);
+}
+
+// Read the unit's recent journal output for the listening-line check.
+// Called after health is back, so the listening line has had time to land.
+async function restartServiceJournal() {
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/journalctl", ["-u", "omp-builder.service", "--since", "5 minutes ago", "-n", "300", "--no-pager"]);
+    return stdout;
+  } catch {
+    return "";
+  }
 }
 
 async function previewStatus(projectId) {
@@ -226,15 +214,25 @@ try {
       reject(error);
     });
   });
+  // Phase 3.5 (§5 fix): the server reports a failed session start as an
+  // `error` frame (e.g. "OMP process limit reached") the moment the socket
+  // opens. Remember it so the wait below names the cause instead of a bare
+  // 120 s timeout.
+  let wsError = null;
   throwawayWs.on("message", (raw) => {
     try {
-      wsEvents.push(JSON.parse(raw.toString()));
+      const event = JSON.parse(raw.toString());
+      wsEvents.push(event);
+      if (event.type === "error" && typeof event.message === "string") wsError = event.message;
     } catch {
       // Ignore non-JSON frames.
     }
   });
   await waitFor(
-    async () => wsEvents.some((e) => e.type === "session_status" && (e.payload?.state === "ready" || e.payload?.state === "connected")),
+    async () => {
+      if (wsError) throw new Error(`OMP session failed over WS: ${wsError}`);
+      return wsEvents.some((e) => e.type === "session_status" && (e.payload?.state === "ready" || e.payload?.state === "connected"));
+    },
     120_000,
     "OMP session ready over WS",
   );
@@ -342,28 +340,12 @@ try {
   assert.ok(!gone.split("\n").some((name) => name.trim() === "omp-preview-134cc3fe"), "Phase 2 container still listed after external rm -f");
   console.log(`  Phase 2 container removed externally; row is now stale (running, no container)`);
 
-  // The concurrently node process cmdline is
-  // "node .../node_modules/.bin/concurrently --kill-others-on-fail ...".
-  // The parent `sh -c` wrapper's cmdline contains "concurrently" too but not
-  // the ".bin/concurrently" path, so require the node binary path.
-  const apiParents = await findPidsByCmdline(["node", ".bin/concurrently"]);
-  assert.equal(apiParents.length, 1, `expected exactly 1 concurrently API parent, found ${apiParents.join(", ")}`);
-  const apiPid = apiParents[0];
-  process.kill(apiPid, "SIGTERM");
-  await waitFor(
-    async () => {
-      try {
-        await fetch(`${api}/api/health`, { signal: AbortSignal.timeout(2000) });
-        return false;
-      } catch {
-        return true;
-      }
-    },
-    30_000,
-    "API port 8787 to go down after SIGTERM",
-  );
-  console.log(`  API (concurrently pid ${apiPid}) stopped; relaunching npm run dev`);
-  relaunchApi();
+  // The service is managed by systemd (Phase 3.5 §2): restart the unit.
+  // Killing the concurrently process directly would race the unit's
+  // Restart=on-failure on the same port, so the old kill + manual
+  // `npm run dev` relaunch is gone — `systemctl restart` is the restart.
+  console.log(`  restarting omp-builder.service via systemctl`);
+  await restartService();
   await waitFor(
     async () => {
       try {
@@ -374,13 +356,15 @@ try {
       }
     },
     120_000,
-    "API health after restart (verify via the restart log, not assumed)",
+    "API health after restart (verify via the journal, not assumed)",
   );
-  const restartLog = await readFile(RESTART_LOG, "utf8");
-  // reconcile() only logs "[preview] startup reconcile" when it removed or
-  // marked something, so the log line is NOT required. The restart is
-  // proven by the listening line + the DB-row effect asserted below.
-  assert.ok(restartLog.includes("OMP Builder API listening"), `restart log has no API listening line; tail:\n${restartLog.slice(-2000)}`);
+  // The journal is read after health is back, so the listening line has
+  // had time to land. reconcile() only logs "[preview] startup
+  // reconcile" when it removed or marked something, so that line is NOT
+  // required. The restart is proven by the listening line + the DB-row
+  // effect asserted below.
+  const restartLog = await restartServiceJournal();
+  assert.ok(restartLog.includes("OMP Builder API listening"), `journal has no API listening line after restart; tail:\n${restartLog.slice(-2000)}`);
   const webUp = await waitFor(
     async () => {
       try {
@@ -483,10 +467,11 @@ try {
   ok("app.db hardening holds across the restart: app.db, app.db-wal and app.db-shm are all 0600");
   console.log(`phase3 e2e checks passed (${passed} checks)`);
 } finally {
-  // Best-effort cleanup: stop previews, kill any lingering OMP child for the
-  // throwaway BEFORE deleting its rows (so no agent_error is written after
-  // deletion), delete the throwaway (DB rows + workspace + session dir +
-  // staging + node_modules volume), revoke the test session.
+  // Best-effort cleanup: stop previews, delete the throwaway through the
+  // API (which closes its OMP session, sweeps any dev-server tree rooted
+  // in the workspace, then removes the DB rows, workspace and session
+  // dir), remove preview staging + the node_modules volume (not owned by
+  // the delete endpoint), revoke the test session.
   try {
     if (throwawayWs) throwawayWs.close();
   } catch {
@@ -495,29 +480,29 @@ try {
   await call("POST", `/api/projects/${PHASE2_ID}/preview/stop`).catch(() => undefined);
   await call("POST", `/api/projects/${GUA_ID}/preview/stop`).catch(() => undefined);
   if (throwawayId) {
-    await call("POST", `/api/projects/${throwawayId}/preview/stop`).catch(() => undefined);
-    const row = db.prepare("SELECT workspace_path, session_dir FROM projects WHERE id = ?").get(throwawayId);
-    const ompChildren = row ? await findPidsByCmdline(["--cwd", String(row.workspace_path)]) : [];
-    for (const pid of ompChildren) {
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch {
-        // Already gone.
+    // Phase 3.5 (§5 fix): deleting through the API instead of a direct DB
+    // delete + cmdline SIGTERM. The old path leaked the OMP child (and
+    // any dev-server tree) whenever the cmdline scan missed it, holding
+    // a pool slot until the 15-minute idle reap.
+    const deleted = await call("DELETE", `/api/projects/${throwawayId}`).catch(() => null);
+    if (deleted?.status === 200) {
+      console.log(`throwaway project ${throwawayId} deleted via API (DB rows, workspace, session dir; swept PIDs: ${JSON.stringify(deleted.data.sweptProcesses ?? [])})`);
+      if (deleted.data.workspaceRemoved === false) {
+        // The API runs as omp-builder and cannot remove foreign-owned
+        // files; this suite runs as root, so finish the removal directly.
+        console.log(`WARNING: API could not remove throwaway workspace (foreign-owned files); removing directly`);
+        await rm(path.join(projectsRoot, throwawayId), { recursive: true, force: true }).catch(() => undefined);
       }
+    } else {
+      console.log(`WARNING: API delete of throwaway ${throwawayId} failed (status ${deleted?.status ?? "unreachable"}); falling back to direct removal`);
+      db.prepare("DELETE FROM projects WHERE id = ?").run(throwawayId);
+      db.prepare("DELETE FROM preview_state WHERE project_id = ?").run(throwawayId);
+      db.prepare("DELETE FROM omp_events WHERE project_id = ?").run(throwawayId);
+      await rm(path.join(projectsRoot, throwawayId), { recursive: true, force: true }).catch(() => undefined);
     }
-    if (ompChildren.length > 0) await sleep(10_000);
-    if (row) {
-      await rm(String(row.workspace_path), { recursive: true, force: true }).catch(() => undefined);
-      await rm(String(row.session_dir), { recursive: true, force: true }).catch(() => undefined);
-    }
-    db.prepare("DELETE FROM projects WHERE id = ?").run(throwawayId);
-    db.prepare("DELETE FROM preview_state WHERE project_id = ?").run(throwawayId);
-    db.prepare("DELETE FROM omp_events WHERE project_id = ?").run(throwawayId);
-    await rm(path.join(projectsRoot, throwawayId), { recursive: true, force: true }).catch(() => undefined);
     await rm(path.join(previewRoot, throwawayId), { recursive: true, force: true }).catch(() => undefined);
     await podman(["rm", "-f", `omp-preview-${throwawayId.slice(0, 8)}`]).catch(() => undefined);
     await podman(["volume", "rm", `omp-preview-nm-${throwawayId.slice(0, 8)}`]).catch(() => undefined);
-    console.log(`throwaway project ${throwawayId} deleted (DB rows, workspace, session dir, staging)`);
   }
   db.prepare("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?").run(new Date().toISOString(), tokenHash);
   try {
@@ -526,12 +511,12 @@ try {
     console.log("test session revoked");
   } catch (error) {
     console.log(`WARNING: could not verify session revocation (API may be down): ${error instanceof Error ? error.message : error}`);
-    // Last-resort: if the API is down, relaunch it so the host is not left broken.
+    // Last-resort: if the API is down, start the service so the host is not left broken.
     try {
       await fetch(`${api}/api/health`, { signal: AbortSignal.timeout(3000) });
     } catch {
-      console.log("API is down after the e2e run — relaunching npm run dev");
-      relaunchApi();
+      console.log("API is down after the e2e run — starting the omp-builder service");
+      await execFileAsync("/usr/bin/systemctl", ["start", "omp-builder.service"]).catch(() => undefined);
       await sleep(20_000);
     }
   }

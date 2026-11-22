@@ -18,10 +18,10 @@ const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3");
 
 const api = process.env.OMP_BUILDER_API ?? "http://127.0.0.1:8787";
-const dbPath = process.env.OMP_BUILDER_DB ?? "/root/projects/omp-builder/data/persistent/app.db";
-const projectsRoot = process.env.OMP_BUILDER_PROJECTS_ROOT ?? "/root/projects/omp-builder/data/projects";
+const dbPath = process.env.OMP_BUILDER_DB ?? "/var/lib/omp-builder/data/persistent/app.db";
+const projectsRoot = process.env.OMP_BUILDER_PROJECTS_ROOT ?? "/var/lib/omp-builder/data/projects";
 const previewRoot = process.env.OMP_BUILDER_PREVIEW_ROOT ?? "/var/lib/omp-builder/previews";
-const repoRoot = process.env.OMP_BUILDER_REPO ?? "/root/projects/omp-builder";
+const repoRoot = process.env.OMP_BUILDER_REPO ?? "/opt/omp-builder";
 const ADMIN_ID = "155e3283-d271-452a-af52-e90f900cd78d";
 const PHASE2_ID = "134cc3fe-631f-4755-9839-67af3bfd8ba9";
 const GUA_ID = "4f75505f-a2d9-4cc9-b6f8-4e3978c6de9b";
@@ -388,21 +388,34 @@ try {
 
   console.log(`phase3 preview checks passed (${passed} checks)`);
 } finally {
-  // Stop any previews we started, delete the throwaway project (DB row +
-  // workspace + staging), and revoke the test session.
+  // Stop any previews we started, delete the throwaway project through
+  // the API (Phase 3.5 §5 fix: the endpoint closes any OMP session and
+  // sweeps workspace-rooted processes instead of a direct DB delete,
+  // which used to leak them), and revoke the test session.
   if (throwawayId) {
     await call("POST", `/api/projects/${throwawayId}/preview/stop`).catch(() => undefined);
   }
   await call("POST", `/api/projects/${PHASE2_ID}/preview/stop`).catch(() => undefined);
   await call("POST", `/api/projects/${GUA_ID}/preview/stop`).catch(() => undefined);
   if (throwawayId) {
-    db.prepare("DELETE FROM projects WHERE id = ?").run(throwawayId);
-    db.prepare("DELETE FROM preview_state WHERE project_id = ?").run(throwawayId);
-    db.prepare("DELETE FROM omp_events WHERE project_id = ?").run(throwawayId);
-    await rm(path.join(projectsRoot, throwawayId), { recursive: true, force: true }).catch(() => undefined);
+    const deleted = await call("DELETE", `/api/projects/${throwawayId}`).catch(() => null);
+    if (deleted?.status !== 200) {
+      console.log(`WARNING: API delete of throwaway ${throwawayId} failed (status ${deleted?.status ?? "unreachable"}); falling back to direct removal`);
+      db.prepare("DELETE FROM projects WHERE id = ?").run(throwawayId);
+      db.prepare("DELETE FROM preview_state WHERE project_id = ?").run(throwawayId);
+      db.prepare("DELETE FROM omp_events WHERE project_id = ?").run(throwawayId);
+      await rm(path.join(projectsRoot, throwawayId), { recursive: true, force: true }).catch(() => undefined);
+    }
+    if (deleted?.status === 200 && deleted.data?.workspaceRemoved === false) {
+      // The API runs as omp-builder and cannot remove foreign-owned files
+      // (this suite writes root-owned subdirs into the workspace); this
+      // suite runs as root, so finish the removal directly.
+      console.log(`WARNING: API could not remove throwaway workspace (foreign-owned files); removing directly`);
+      await rm(path.join(projectsRoot, throwawayId), { recursive: true, force: true }).catch(() => undefined);
+    }
     await rm(path.join(previewRoot, throwawayId), { recursive: true, force: true }).catch(() => undefined);
     await podman(["volume", "rm", `omp-preview-nm-${throwawayId.slice(0, 8)}`]).catch(() => undefined);
-    console.log(`throwaway project ${throwawayId} deleted (DB row, workspace, staging)`);
+    console.log(`throwaway project ${throwawayId} deleted via API (DB row, workspace, staging)`);
   }
   db.prepare("UPDATE sessions SET revoked_at = ? WHERE token_hash = ?").run(new Date().toISOString(), tokenHash);
   const revoked = await fetch(`${api}/api/projects/${PHASE2_ID}/preview/status`, { headers: { cookie: `omp_builder_session=${token}` } });

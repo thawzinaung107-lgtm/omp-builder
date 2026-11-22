@@ -4,11 +4,19 @@ import os from "node:os";
 import path from "node:path";
 import { OmpRpcSession, resolveOmpBinary } from "../apps/api/dist/omp-rpc.js";
 
+// Phase 3.5 §2: OMP needs a config dir with a models.yml to pick a default
+// model at startup. The API always passes OMP_CONFIG_DIR + a --model, so a
+// bare spawn without them only worked as root (ambient /root/.omp config).
+// Point the smoke spawn at the real config dir, like the API does.
+const configDir = process.env.OMP_BUILDER_CONFIG_DIR ?? "/var/lib/omp-builder/data/omp-config";
+process.env.OMP_CONFIG_DIR = configDir;
+process.env.PI_CODING_AGENT_DIR = configDir;
+
 const root = await mkdtemp(path.join(os.tmpdir(), "omp-builder-rpc-"));
 const events = [];
 let exitError;
 try {
-  assert.equal(resolveOmpBinary("/root/.local/bin/omp"), "/root/.local/bin/omp");
+  assert.equal(resolveOmpBinary("/usr/local/bin/omp"), "/usr/local/bin/omp");
   assert.throws(() => resolveOmpBinary(path.join(root, "missing-omp")), /OMP executable not found/);
   const session = new OmpRpcSession({ projectId: "rpc-smoke", cwd: path.join(root, "project"), sessionDir: path.join(root, "session"), binary: "omp", resume: true }, { onEvent: (type, payload) => events.push({ type, payload }), onExit: (error) => { exitError = error?.message; } });
   await session.start();

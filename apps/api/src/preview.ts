@@ -9,11 +9,13 @@ import type Database from "better-sqlite3";
  * Phase 3C — Rootless Podman preview manager.
  *
  * Security model:
- * - The live workspace (0700, root-owned) is NEVER bind-mounted into a
- *   container. The API (root) copies it to a staging directory owned by the
+ * - The live workspace (0700, omp-builder-owned) is NEVER bind-mounted into a
+ *   container. The API copies it to a staging directory owned by the
  *   service user omp-builder, excluding secrets and build outputs, and only
  *   the staging copy is mounted, read-only, at /app.
- * - Containers run as omp-builder via `runuser` (argv arrays, no shell).
+ * - Containers run as omp-builder (via `runuser` when the API runs as root,
+ *   directly when the API already runs as omp-builder — runuser refuses
+ *   non-root callers; see runPodman and docs/MIGRATION-PHASE3.5-2.md).
  *   No Docker/host socket, no host network namespace, no privileged flag,
  *   all capabilities dropped, no-new-privileges, read-only rootfs with a
  *   /tmp tmpfs, a named volume for /app/node_modules only, 512 MiB RAM,
@@ -119,13 +121,34 @@ export class PreviewError extends Error {
 
 type PodmanResult = { code: number; stdout: string; stderr: string };
 
-/** Run podman as omp-builder via runuser. Argv arrays only — never a shell. */
+/**
+ * Run podman as omp-builder. Argv arrays only — never a shell.
+ * Phase 3.5 §2: when the API itself already runs as omp-builder, spawn
+ * podman directly with the podman env via spawn `env` — runuser refuses
+ * non-root callers ("runuser: may not be used by non-root users",
+ * verified 2026-11-22). When the API runs as root (pre-migration /
+ * rollback), the runuser + /usr/bin/env argv form is kept unchanged.
+ */
 export function runPodman(args: string[], timeoutMs = 60_000): Promise<PodmanResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(RUNUSER, ["-u", SERVICE_USER, "--", ...PODMAN_ENV_PREFIX, PODMAN, ...PODMAN_GLOBAL_FLAGS, ...args], {
-      cwd: "/",
-      timeout: timeoutMs,
-    });
+    const { uid } = serviceUserIds();
+    const alreadyServiceUser = typeof process.getuid === "function" && process.getuid() === uid;
+    const child = alreadyServiceUser
+      ? spawn(PODMAN, [...PODMAN_GLOBAL_FLAGS, ...args], {
+          cwd: "/",
+          timeout: timeoutMs,
+          env: {
+            ...process.env,
+            XDG_RUNTIME_DIR: SERVICE_XDG_RUNTIME_DIR,
+            DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/996/bus",
+            HOME: SERVICE_HOME,
+            PATH: "/usr/local/bin:/usr/bin:/bin",
+          },
+        })
+      : spawn(RUNUSER, ["-u", SERVICE_USER, "--", ...PODMAN_ENV_PREFIX, PODMAN, ...PODMAN_GLOBAL_FLAGS, ...args], {
+          cwd: "/",
+          timeout: timeoutMs,
+        });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => {
@@ -509,9 +532,30 @@ export class PreviewManager {
 
   private attachLogFollower(projectId: string, containerName: string): void {
     this.detachLogFollower(projectId);
-    const child = spawn(RUNUSER, ["-u", SERVICE_USER, "--", ...PODMAN_ENV_PREFIX, PODMAN, ...PODMAN_GLOBAL_FLAGS, "logs", "-f", "--tail", "20", containerName], {
-      cwd: "/",
-    });
+    // Phase 3.5 fix pass (§2 fast path, same as runPodman): when the API
+    // already runs as omp-builder, spawn podman directly — runuser refuses
+    // non-root callers ("runuser: may not be used by non-root users").
+    // This was the one stray unconditional runuser spawn left after the
+    // §2 migration: it failed instantly on every preview start, its
+    // stderr was fed into the preview log stream, and the follower died
+    // so live container output never streamed. Root-run rollback keeps
+    // the runuser form.
+    const { uid } = serviceUserIds();
+    const alreadyServiceUser = typeof process.getuid === "function" && process.getuid() === uid;
+    const child = alreadyServiceUser
+      ? spawn(PODMAN, [...PODMAN_GLOBAL_FLAGS, "logs", "-f", "--tail", "20", containerName], {
+          cwd: "/",
+          env: {
+            ...process.env,
+            XDG_RUNTIME_DIR: SERVICE_XDG_RUNTIME_DIR,
+            DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/996/bus",
+            HOME: SERVICE_HOME,
+            PATH: "/usr/local/bin:/usr/bin:/bin",
+          },
+        })
+      : spawn(RUNUSER, ["-u", SERVICE_USER, "--", ...PODMAN_ENV_PREFIX, PODMAN, ...PODMAN_GLOBAL_FLAGS, "logs", "-f", "--tail", "20", containerName], {
+          cwd: "/",
+        });
     this.logFollowers.set(projectId, child);
     let buffer = "";
     const flushLines = () => {
@@ -584,8 +628,8 @@ export class PreviewManager {
         "-d",
         "--name",
         containerName,
-        // The default log driver here is journald, whose entries this
-        // runuser-spawned podman cannot read back (podman logs comes back
+        // The default log driver here is journald, whose entries a
+        // service-user podman cannot read back (podman logs comes back
         // empty). k8s-file keeps container stdout in a file podman logs
         // can actually read, which the logs endpoint and follower need.
         "--log-driver",

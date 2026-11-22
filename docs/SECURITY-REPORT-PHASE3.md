@@ -202,3 +202,36 @@ All verification ran against the live VPS (`root@191.40.5.90`) on
   --timeout` returned an empty DOM. CDP (navigate + 10 s wait +
   `Runtime.evaluate`) works reliably. Logged-in UI was not
   click-tested (no admin password) — user QC.
+
+## Addendum — Phase 3.5 §2: non-root migration (2026-11-22)
+
+- **What changed.** The API, web server, OMP RPC children, and preview
+  containers now all run as the `omp-builder` service user (uid 996).
+  App moved `/root/projects/omp-builder` → `/opt/omp-builder`; data
+  moved to `/var/lib/omp-builder/data/` (DB, workspaces, OMP
+  sessions/config); Node 22.23.5 copied to `/usr/local/node-22.23.5`;
+  services run under the `omp-builder.service` systemd unit
+  (`npm run dev`, `Restart=on-failure`). OMP-as-service-user is the
+  default (empty `OMP_RUN_AS_USER_PROJECT_IDS` = all projects). The
+  pre-migration tree is kept frozen as the rollback copy. Full record:
+  `docs/MIGRATION-PHASE3.5-2.md`.
+- **Blocker found and fixed in §2.** `runuser` refuses non-root callers
+  (`runuser: may not be used by non-root users`), so both
+  `runuser -u omp-builder` call sites would have failed under the new
+  layout. Both now have a same-user fast path (direct spawn when the
+  API already runs as uid 996; root-run paths unchanged).
+- **Closed gap.** The 3C `models.yml` sync gap is closed: OMP children
+  now read the real config dir (`OMP_USER_CONFIG_DIR` =
+  `/var/lib/omp-builder/data/omp-config`).
+- **Re-verification (2026-11-22).** `tests/phase3-e2e.mjs` 4/4
+  (real Kuoai prompt as `omp-builder` → preview → gateway →
+  `systemctl restart` recovery → security re-probes);
+  `tests/phase3-files.mjs` 12/12, `phase3-monaco.mjs` 6/6,
+  `phase3-gateway.mjs` 13/13, `tests/phase3-preview.mjs` 12/12;
+  `npm run test:rpc` pass, `npm run test:security` pass,
+  `npm run typecheck` pass, `npm audit --omit=dev` 0 vulnerabilities —
+  all run as the service user except the suites themselves (root).
+- **Still open (unchanged).** Egress allow-listing for preview
+  containers; the systemd unit is a single dev-workflow unit, not a
+  split production deployment; the Gua 4173 server still serves from
+  the old path until restarted.

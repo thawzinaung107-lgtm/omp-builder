@@ -26,6 +26,39 @@
 - Dev limitation: the gateway and the Builder share one origin in development, so the sandbox (not origin separation) is the isolation boundary. True origin separation needs a dedicated preview domain in production (e.g. `preview-<id>.example.com` with its own cookie scope); until then, do not serve the Builder and previews from a shared production origin.
 - Known gaps (not claimed as done): the gateway trusts the container's HTTP responses (a malicious preview could serve phishing content inside the iframe — the sandbox blocks credential theft but not lookalike UI); egress allow-listing is still a follow-up (see 3C).
 
+## Phase 3.5 §2 — Non-root execution is now the default (implemented 2026-11-22)
+
+- The API, web server, OMP RPC children, and preview containers all run
+  as the `omp-builder` service user (uid 996). Nothing Builder-related
+  runs as root anymore. App: `/opt/omp-builder`; data:
+  `/var/lib/omp-builder/data/` (DB, workspaces, OMP sessions/config);
+  Node 22.23.5: `/usr/local/node-22.23.5`; services via the
+  `omp-builder.service` systemd unit (`npm run dev`, `Restart=on-failure`).
+  Full record: `docs/MIGRATION-PHASE3.5-2.md`.
+- OMP-as-service-user is the default, not opt-in: an empty
+  `OMP_RUN_AS_USER_PROJECT_IDS` now means ALL projects run OMP as
+  `omp-builder` (previously it meant none). `OMP_RUN_AS_USER=false`
+  restores root spawn (escape hatch only). The 3C `models.yml` sync gap
+  is closed: OMP children now use the real config dir via
+  `OMP_USER_CONFIG_DIR=/var/lib/omp-builder/data/omp-config`, so the
+  API-written `models.yml` is what the child reads; the stale copy at
+  `/var/lib/omp-builder/omp-config` is unused. The 3C `/root`/repo-root
+  traversal grants are gone — the API owns the tree, so same-uid
+  children need no grants.
+- `runuser` refuses non-root callers (verified: `runuser: may not be
+  used by non-root users`), so both `runuser -u omp-builder` call sites
+  have a same-user fast path that spawns directly when the API already
+  runs as uid 996 (`OmpRpcSession.start()` for OMP,
+  `runPodman()` for podman, with the podman env passed via spawn `env`
+  instead of the `/usr/bin/env …` argv form). The root-run paths are
+  kept unchanged for the rollback layout. No new privilege is granted:
+  the fast paths spawn the same binaries with the same argv/env as
+  before, only without the (now impossible) user switch.
+- Verified by the re-run `tests/phase3-e2e.mjs` (real Kuoai prompt →
+  preview → gateway → `systemctl restart` recovery → security
+  re-probes) plus `npm run test:rpc`, `npm run test:security`,
+  `npm run typecheck`, `npm run build`, `npm audit --omit=dev`.
+
 ## Current Phase 2 controls
 
 - Single-admin setup is one-time and password hashes use Node's `scrypt` with a random salt.

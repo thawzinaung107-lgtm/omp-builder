@@ -63,7 +63,12 @@ export class OmpRpcSession {
     const binary = resolveOmpBinary(this.options.binary);
     mkdirSync(this.options.sessionDir, { recursive: true, mode: 0o700 });
     mkdirSync(this.options.cwd, { recursive: true, mode: 0o700 });
-    if (this.options.runAsUser) {
+    // Whether the API already runs as the service user: then the chown
+    // below is a no-op and runuser must not be used (it refuses non-root
+    // callers). Computed once; serviceUserIds() throws when the user does
+    // not exist, which is already fatal for runAsUser mode.
+    const alreadyServiceUser = this.options.runAsUser && typeof process.getuid === "function" && process.getuid() === serviceUserIds().uid;
+    if (this.options.runAsUser && !alreadyServiceUser) {
       // The API creates these dirs as root on first use; the service user
       // needs to own them or OMP fails with EACCES on chdir/mkdir. Top
       // dirs only — OMP creates its own subdirs. (For a pre-existing
@@ -78,16 +83,20 @@ export class OmpRpcSession {
     if (this.options.provider && this.options.modelId) args.push("--model", `${this.options.provider}/${this.options.modelId}`);
     const childEnv = childEnvironment(this.options.env);
     if (this.options.runAsUser) {
-      // Phase 3C experiment (brief §6): run the OMP child as the
-      // omp-builder service user via runuser. Argv arrays only — no shell.
+      // Phase 3C (§6), default since 3.5 §2: run the OMP child as the
+      // omp-builder service user. Argv arrays only — no shell. Two paths
+      // to the same result: when the API itself already runs as that
+      // user, spawn the binary directly — runuser refuses non-root
+      // callers ("runuser: may not be used by non-root users", verified
+      // 2026-11-22). When the API runs as root (pre-migration layout /
+      // rollback), runuser is still used.
       // The OMP binary lives under /root (unreachable to omp-builder), so
       // a world-executable copy at OMP_BIN_USER is used instead; the OMP
-      // config dir is the omp-builder-owned copy at OMP_USER_CONFIG_DIR
-      // (its models.yml must be kept in sync with the real config dir —
-      // see the Phase 3C report). HOME/XDG point at the service user's
-      // own directories. The project workspace + session dir must already
-      // be owned by omp-builder. Falls back to root spawn unless the
-      // project is opted in via OMP_RUN_AS_USER_PROJECT_IDS.
+      // config dir is OMP_USER_CONFIG_DIR — post-migration the .env
+      // points it at the real config dir, so its models.yml is always
+      // in sync (the 3C sync gap is closed). HOME/XDG point at the
+      // service user's own directories. The project workspace + session
+      // dir must already be owned by omp-builder.
       const userBinary = process.env.OMP_BIN_USER ?? "/usr/local/bin/omp";
       const userConfigDir = process.env.OMP_USER_CONFIG_DIR ?? "/var/lib/omp-builder/omp-config";
       // The environment MUST be passed via spawn's `env` option (execve
@@ -97,17 +106,20 @@ export class OmpRpcSession {
       // preserves the caller's environment for the child (verified
       // 2026-11-22: custom vars and values with spaces pass through, and
       // runuser itself sets HOME/USER/LOGNAME to the target user).
-      this.child = spawn("/usr/sbin/runuser", ["-u", "omp-builder", "--", userBinary, ...args], {
-        cwd: this.options.cwd,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...childEnv,
-          HOME: "/var/lib/omp-builder",
-          XDG_RUNTIME_DIR: "/run/user/996",
-          OMP_CONFIG_DIR: userConfigDir,
-          PI_CODING_AGENT_DIR: userConfigDir,
-        },
-      });
+      const childServiceEnv = {
+        ...childEnv,
+        HOME: "/var/lib/omp-builder",
+        XDG_RUNTIME_DIR: "/run/user/996",
+        OMP_CONFIG_DIR: userConfigDir,
+        PI_CODING_AGENT_DIR: userConfigDir,
+      };
+      this.child = alreadyServiceUser
+        ? spawn(userBinary, args, { cwd: this.options.cwd, stdio: ["pipe", "pipe", "pipe"], env: childServiceEnv })
+        : spawn("/usr/sbin/runuser", ["-u", "omp-builder", "--", userBinary, ...args], {
+            cwd: this.options.cwd,
+            stdio: ["pipe", "pipe", "pipe"],
+            env: childServiceEnv,
+          });
     } else {
       this.child = spawn(binary, args, { cwd: this.options.cwd, stdio: ["pipe", "pipe", "pipe"], env: childEnv });
     }

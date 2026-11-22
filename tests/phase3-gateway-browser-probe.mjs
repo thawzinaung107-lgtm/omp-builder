@@ -43,8 +43,8 @@ const SSH_HOST = process.env.OMP_BUILDER_SSH ?? "root@191.40.5.90";
 const SSH_KEY = process.env.OMP_BUILDER_SSH_KEY ?? path.join(homedir(), ".ssh", "id_ed25519");
 const API = process.env.OMP_BUILDER_API ?? "http://127.0.0.1:8787";
 const ADMIN_ID = "155e3283-d271-452a-af52-e90f900cd78d";
-const DB_PATH = "/root/projects/omp-builder/data/persistent/app.db";
-const REPO = "/root/projects/omp-builder";
+const DB_PATH = "/var/lib/omp-builder/data/persistent/app.db";
+const REPO = "/opt/omp-builder";
 
 const execFileAsync = promisify(execFile);
 const sshBase = ["-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-i", SSH_KEY];
@@ -210,7 +210,7 @@ try {
     await ssh(
       `export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1; nvm use 22 >/dev/null 2>&1; cd ${REPO} && node -e "const D=require('better-sqlite3'); const db=new D('${DB_PATH}'); db.prepare('DELETE FROM projects WHERE id=?').run('${throwawayId}'); db.prepare('DELETE FROM preview_state WHERE project_id=?').run('${throwawayId}'); db.prepare('DELETE FROM omp_events WHERE project_id=?').run('${throwawayId}'); db.prepare('UPDATE sessions SET revoked_at=? WHERE token_hash=?').run(new Date().toISOString(), '${tokenHash}'); db.close();"`,
     ).catch(() => undefined);
-    await ssh(`cd /tmp && rm -rf ${REPO}/data/projects/${throwawayId} /var/lib/omp-builder/previews/${throwawayId}; runuser -u omp-builder -- env XDG_RUNTIME_DIR=/run/user/996 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/996/bus HOME=/var/lib/omp-builder /usr/bin/podman --cgroup-manager=systemd rm -f omp-preview-${throwawayId.slice(0, 8)} 2>/dev/null; runuser -u omp-builder -- env XDG_RUNTIME_DIR=/run/user/996 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/996/bus HOME=/var/lib/omp-builder /usr/bin/podman --cgroup-manager=systemd volume rm omp-preview-nm-${throwawayId.slice(0, 8)} 2>/dev/null; true`).catch(() => undefined);
+    await ssh(`rm -rf ${REPO}/data/projects/${throwawayId} /var/lib/omp-builder/previews/${throwawayId}; runuser -u omp-builder -- env XDG_RUNTIME_DIR=/run/user/996 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/996/bus HOME=/var/lib/omp-builder /usr/bin/podman --cgroup-manager=systemd rm -f omp-preview-${throwawayId.slice(0, 8)} 2>/dev/null; runuser -u omp-builder -- env XDG_RUNTIME_DIR=/run/user/996 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/996/bus HOME=/var/lib/omp-builder /usr/bin/podman --cgroup-manager=systemd volume rm omp-preview-nm-${throwawayId.slice(0, 8)} 2>/dev/null; true`).catch(() => undefined);
     console.log(`throwaway project ${throwawayId} deleted; test session revoked`);
   }
 }

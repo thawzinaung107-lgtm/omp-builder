@@ -20,9 +20,9 @@ import Database from "better-sqlite3";
 // project for the save-path checks.
 // Env overrides: OMP_BUILDER_API, OMP_BUILDER_DB, OMP_BUILDER_ROOT.
 
-const repoRoot = process.env.OMP_BUILDER_ROOT ?? "/root/projects/omp-builder";
+const repoRoot = process.env.OMP_BUILDER_ROOT ?? "/opt/omp-builder";
 const api = process.env.OMP_BUILDER_API ?? "http://127.0.0.1:8787";
-const dbPath = process.env.OMP_BUILDER_DB ?? "/root/projects/omp-builder/data/persistent/app.db";
+const dbPath = process.env.OMP_BUILDER_DB ?? "/var/lib/omp-builder/data/persistent/app.db";
 const ADMIN_ID = "155e3283-d271-452a-af52-e90f900cd78d";
 const EXPECTED_MONACO = "0.57.0";
 const MIN_DOMPURIFY = [3, 4, 13];

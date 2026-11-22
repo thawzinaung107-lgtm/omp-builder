@@ -11,7 +11,7 @@ const port = 8900 + Math.floor(Math.random() * 500);
 const secret = "masked-secret-value";
 const allowedOrigin = "http://new-lovable.localhost:33295";
 const changedOrigin = "http://new-lovable.localhost:45025";
-const env = { ...process.env, API_HOST: "127.0.0.1", API_PORT: String(port), WEB_ORIGINS: "http://localhost:5173", DEV_DYNAMIC_FORWARD_ORIGIN: "true", DATABASE_PATH: path.join(temp, "app.db"), PROJECTS_ROOT: path.join(temp, "projects"), OMP_SESSION_ROOT: path.join(temp, "sessions"), OMP_CONFIG_DIR: path.join(temp, "config"), OMP_MASTER_KEY: Buffer.alloc(32, 7).toString("base64"), OMP_BIN: "/root/.local/bin/omp" };
+const env = { ...process.env, API_HOST: "127.0.0.1", API_PORT: String(port), WEB_ORIGINS: "http://localhost:5173", DEV_DYNAMIC_FORWARD_ORIGIN: "true", DATABASE_PATH: path.join(temp, "app.db"), PROJECTS_ROOT: path.join(temp, "projects"), OMP_SESSION_ROOT: path.join(temp, "sessions"), OMP_CONFIG_DIR: path.join(temp, "config"), OMP_MASTER_KEY: Buffer.alloc(32, 7).toString("base64"), OMP_BIN: "/usr/local/bin/omp" };
 new Database(env.DATABASE_PATH).close();
 const missingEnv = { ...env, API_PORT: String(port + 2), DATABASE_PATH: path.join(temp, "missing", "app.db") };
 const missing = spawn(process.execPath, [path.join(root, "apps/api/dist/server.js")], { cwd: "/tmp", env: missingEnv, stdio: ["ignore", "pipe", "pipe"] });

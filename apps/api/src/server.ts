@@ -1,7 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual, createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { chmodSync, chownSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import path from "node:path";
@@ -14,6 +15,7 @@ import type { OmpRpcSession } from "./omp-rpc.js";
 import { credentialEnvName, decryptSecret, encryptSecret, validateProviderUrl } from "./provider-security.js";
 import { FileError, createEntry, deleteEntry, listTree, readTextFile, renameEntry, writeTextFile } from "./files.js";
 import { PreviewError, PreviewManager, serviceUserIds } from "./preview.js";
+import { terminateWorkspaceProcesses } from "./workspace-sweep.js";
 import { proxyPreviewHttp, proxyPreviewUpgrade } from "./gateway.js";
 import { WorkspaceWatcher } from "./watcher.js";
 
@@ -26,17 +28,21 @@ mkdirSync(projectsRoot, { recursive: true, mode: 0o700 });
 mkdirSync(sessionRoot, { recursive: true, mode: 0o700 });
 mkdirSync(configDir, { recursive: true, mode: 0o700 });
 chmodSync(sessionRoot, 0o700); chmodSync(configDir, 0o700);
-// Phase 3C (§6): when any project is opted into OMP-as-service-user, the
-// session root must stay traversable by omp-builder — the chmod above
-// would otherwise reset it to root-only on every API restart and break
-// opted-in sessions with EACCES. Traverse-only (0710, group omp-builder);
-// the per-project session dirs themselves stay 0700 omp-builder-owned.
-if (config.ompRunAsUserProjectIds.size > 0) {
+// Phase 3C (§6), narrowed in 3.5 §2: when the API runs as root and any
+// project runs OMP as the service user, the session root must stay
+// traversable by omp-builder — the chmod above would otherwise reset it
+// to root-only on every API restart and break opted-in sessions with
+// EACCES. Traverse-only (0710, group omp-builder); the per-project
+// session dirs themselves stay 0700 omp-builder-owned. When the API
+// itself runs as omp-builder (the post-migration default) this is
+// unnecessary — the API already owns the tree — and chown to root would
+// fail, so it is skipped.
+if (process.getuid?.() === 0 && (config.ompRunAsUserAll || config.ompRunAsUserProjectIds.size > 0)) {
   try {
     const { gid } = serviceUserIds();
     chownSync(sessionRoot, 0, gid);
     chmodSync(sessionRoot, 0o710);
-    console.log(`[omp] ${config.ompRunAsUserProjectIds.size} project(s) opted into OMP-as-service-user; session root traversable by omp-builder`);
+    console.log("[omp] OMP-as-service-user active; session root traversable by omp-builder");
   } catch (error) {
     console.error("[omp] could not make session root traversable for omp-builder:", error instanceof Error ? error.message : error);
   }
@@ -110,7 +116,7 @@ function persistEvent(projectId: string, type: string, payload: Record<string, u
 function sendError(ws: WebSocket, message: string): void { if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "error", message, timestamp: new Date().toISOString() })); }
 function replay(ws: WebSocket, projectId: string, afterEventId = 0): void { const rows = db.prepare("SELECT id, type, payload_json, created_at FROM omp_events WHERE project_id = ? AND id > ? ORDER BY id ASC").all(projectId, afterEventId) as Array<{ id: number; type: string; payload_json: string; created_at: string }>; for (const row of rows) { let payload: Record<string, unknown>; try { payload = JSON.parse(row.payload_json) as Record<string, unknown>; } catch { payload = { value: "Invalid persisted event" }; } sendEvent(ws, { type: row.type, eventId: Number(row.id), projectId, payload, timestamp: row.created_at }); } }
 function updateProject(id: string, values: { status?: string; provider?: string | null; modelId?: string | null }): void { const now = new Date().toISOString(); db.prepare("UPDATE projects SET status = COALESCE(?, status), model_provider = COALESCE(?, model_provider), model_id = COALESCE(?, model_id), updated_at = ? WHERE id = ?").run(values.status ?? null, values.provider ?? null, values.modelId ?? null, now, id); }
-const manager = new OmpSessionManager({ binary: ompBinary, projectsRoot, sessionRoot, maxProcesses: ompMaxProcesses, idleMs: ompIdleMs, runAsUserFor: (id) => config.ompRunAsUserProjectIds.has(id) });
+const manager = new OmpSessionManager({ binary: ompBinary, projectsRoot, sessionRoot, maxProcesses: ompMaxProcesses, idleMs: ompIdleMs, runAsUserFor: (id) => config.ompRunAsUserAll || config.ompRunAsUserProjectIds.has(id), isProjectAlive: (id) => { try { projectRow(id); return true; } catch { return false; } } });
 // Phase 3C — rootless Podman preview manager. preview_log events are
 // persisted for the Logs tab but capped at the newest 200 per project.
 const previewManager = new PreviewManager({
@@ -279,6 +285,43 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const projectMatch = url.pathname.match(/^\/api\/projects\/([0-9a-f-]+)(?:\/session)?$/);
+    // Phase 3.5 (§5 fix) — project deletion. There was no delete route at
+    // all: the only deletion path was a direct DB delete in test cleanup,
+    // which left the project's OMP child alive holding a pool slot (and
+    // any dev-server tree the agent had started). Deleting through the API
+    // closes the OMP session first (freeing its pool slot), stops the
+    // preview, sweeps any process still rooted in the workspace, and only
+    // then removes the DB rows, workspace and session dir. The API runs as
+    // omp-builder, so a workspace containing directories owned by another
+    // user (e.g. root-owned subdirs written by a root-run test) cannot
+    // always be removed by it: the removal result is reported in the
+    // response instead of being silently swallowed, so the caller can
+    // finish the removal with the privileges it has. Preview staging
+    // and the node_modules volume are not removed here (PreviewManager
+    // owns those); callers that need a fully clean host remove them too.
+    if (projectMatch && method === "DELETE") {
+      const id = projectMatch[1];
+      const row = projectRow(id);
+      const workspacePath = String(row.workspace_path);
+      const sessionDir = String(row.session_dir);
+      const peers = sockets.get(id);
+      if (peers) { for (const ws of peers) { try { ws.close(1000, "Project deleted"); } catch { /* already closed */ } } sockets.delete(id); }
+      workspaceWatcher.unwatch(id);
+      await previewManager.stop(id).catch(() => undefined);
+      await manager.closeProject(id);
+      const swept = await terminateWorkspaceProcesses(workspacePath);
+      db.prepare("DELETE FROM omp_events WHERE project_id = ?").run(id);
+      db.prepare("DELETE FROM preview_state WHERE project_id = ?").run(id);
+      db.prepare("DELETE FROM projects WHERE id = ?").run(id);
+      await rm(workspacePath, { recursive: true, force: true }).catch(() => undefined);
+      await rm(sessionDir, { recursive: true, force: true }).catch(() => undefined);
+      const workspaceRemoved = !existsSync(workspacePath);
+      const sessionDirRemoved = !existsSync(sessionDir);
+      if (swept.killed.length > 0 || swept.survivors.length > 0) console.log(`[project] deleted ${id}; workspace sweep terminated PIDs ${swept.killed.join(", ") || "none"}; survivors: ${swept.survivors.join(", ") || "none"}`);
+      if (!workspaceRemoved || !sessionDirRemoved) console.log(`[project] deleted ${id} but could not remove ${[!workspaceRemoved ? "workspace" : "", !sessionDirRemoved ? "session dir" : ""].filter(Boolean).join(" and ")} (owned by another user?)`);
+      json(res, 200, { ok: true, sweptProcesses: swept.killed, sweepSurvivors: swept.survivors, workspaceRemoved, sessionDirRemoved });
+      return;
+    }
     if (projectMatch && method === "GET" && url.pathname.endsWith("/session")) { const row = projectRow(projectMatch[1]); const after = Number(url.searchParams.get("afterEventId") ?? 0); const events = (db.prepare("SELECT id, project_id, type, payload_json, created_at FROM omp_events WHERE project_id = ? AND id > ? ORDER BY id ASC").all(projectMatch[1], Number.isSafeInteger(after) && after >= 0 ? after : 0) as Array<Record<string, unknown>>).map((event) => ({ id: Number(event.id), projectId: event.project_id, type: event.type, payload: JSON.parse(String(event.payload_json)), createdAt: event.created_at })); json(res, 200, { project: projectView(row), events }); return; }
     if (projectMatch && method === "GET") { const row = projectRow(projectMatch[1]); json(res, 200, { project: projectView(row) }); return; }
     json(res, 404, { error: "Not found" });

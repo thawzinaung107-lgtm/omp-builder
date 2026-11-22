@@ -223,7 +223,7 @@ export function FileExplorer({
               )}
             </button>
           )}
-          <span className="hidden shrink-0 items-center gap-0.5 opacity-0 transition group-hover:opacity-100 group-focus-within:opacity-100">
+          <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition group-hover:opacity-100 group-focus-within:opacity-100">
             <button
               type="button"
               title={`Rename ${entry.name}`}

@@ -1,6 +1,8 @@
 # Deployment
 
-OMP Builder as deployed on the VPS (verified 2026-11-22, Phase 3E). This
+OMP Builder as deployed on the VPS (verified 2026-11-22, Phase 3E;
+migrated to non-root execution in Phase 3.5 §2 — see
+`docs/MIGRATION-PHASE3.5-2.md`). This
 document describes the real host, not a template: domain and production
 reverse-proxy details are still open, so do not apply the production
 section blindly.
@@ -15,24 +17,33 @@ section blindly.
   `NODE_OPTIONS=--max-old-space-size=2560` was baked into that script
   (Phase 3E). Run any full build with
   `NODE_OPTIONS=--max-old-space-size=2560 npm run build`.
-- Node **22.23.5 via nvm** (`/root/.nvm/versions/node/v22.23.5/bin`). The
-  system `node` is v18 and **cannot** run this repo (`better-sqlite3` is
-  compiled for Node 22, `NODE_MODULE_VERSION 127`). Every command in this
-  document assumes `export PATH=/root/.nvm/versions/node/v22.23.5/bin:$PATH`.
-- Repo `/root/projects/omp-builder`, branch `feature/phase-3-browser-ide`.
-  Never commit `data/` or secrets; see `.gitignore`.
+- Node **22.23.5** at `/usr/local/node-22.23.5/bin` (world-readable copy
+  of the verified nvm install; the system `node` is v18 and **cannot**
+  run this repo — `better-sqlite3` is compiled for Node 22,
+  `NODE_MODULE_VERSION 127`). Every command in this document assumes
+  `export PATH=/usr/local/node-22.23.5/bin:$PATH`. The old nvm path
+  (`/root/.nvm/versions/node/v22.23.5/bin`) still exists but is
+  unreachable to the service user.
+- Repo `/opt/omp-builder`, branch `feature/phase-3.5-hardening`.
+  Data (SQLite, workspaces, OMP sessions/config) under
+  `/var/lib/omp-builder/data/`. Never commit `data/` or secrets; see
+  `.gitignore`. The pre-migration tree `/root/projects/omp-builder` is
+  kept frozen as the rollback copy — do not run services from both
+  locations at once.
 - Podman **4.9.3** (crun, overlay, cgroup2fs). Node image cached:
   `docker.io/library/node:22-alpine`.
 
-## Services (development, as running)
+## Services (as running)
 
-There is no systemd unit yet — services run under one `npm run dev`
-(concurrently) process, started 2026-11-22 and supervised by hand:
+One systemd unit, `omp-builder.service` (`User=omp-builder`,
+`WorkingDirectory=/opt/omp-builder`, `Restart=on-failure`), runs
+`npm run dev` (concurrently: tsx-watch API + Vite web). It is enabled,
+so it starts on boot.
 
 | Service | Listen | Process |
 | --- | --- | --- |
-| API | `127.0.0.1:8787` | `tsx watch src/server.ts` (workspace `@omp-builder/api`) |
-| Web (Vite dev) | `127.0.0.1:5173` (serves on all interfaces) | `vite` (workspace `@omp-builder/web`) |
+| API | `127.0.0.1:8787` | `tsx watch src/server.ts` (workspace `@omp-builder/api`), as `omp-builder` |
+| Web (Vite dev) | `127.0.0.1:5173` (serves on all interfaces) | `vite` (workspace `@omp-builder/web`), as `omp-builder` |
 
 Health: `curl http://127.0.0.1:8787/api/health` → `{"ok":true}`.
 Web: `curl http://127.0.0.1:5173/` → 200.
@@ -40,27 +51,26 @@ Web: `curl http://127.0.0.1:5173/` → 200.
 ### Start / restart
 
 ```sh
-export PATH=/root/.nvm/versions/node/v22.23.5/bin:$PATH
-cd /root/projects/omp-builder
-# Find the concurrently parent by its exact node cmdline (the parent
-# `sh -c` wrapper matches "concurrently" too — do NOT kill by pattern):
-node -e "const fs=require('fs');for(const p of fs.readdirSync('/proc')){if(!/^\d+$/.test(p))continue;try{const c=fs.readFileSync('/proc/'+p+'/cmdline','utf8').replace(/\0/g,' ');if(c.includes('node')&&c.includes('.bin/concurrently'))console.log(p,c)}catch{}}"
-kill <concurrently-pid>        # SIGTERM; wait for 8787 to stop answering
-setsid nohup npm run dev > /tmp/npm-dev.log 2>&1 < /dev/null &
+systemctl restart omp-builder.service
+systemctl status omp-builder.service --no-pager
 curl -s http://127.0.0.1:8787/api/health   # must return {"ok":true}
-# Verify the restart in the log — tsx watch restarts are flaky, never assume:
-grep -E "OMP Builder API listening|startup reconcile" /tmp/npm-dev.log
+# Verify the restart in the journal — tsx watch restarts are flaky, never assume:
+journalctl -u omp-builder.service --since "5 minutes ago" -n 100 --no-pager | grep -E "OMP Builder API listening|startup reconcile"
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5173/
 ```
 
-Restarting `npm run dev` restarts **both** API and web. The API logs its
-preview reconciliation on every start (`[preview] startup reconcile`).
+Do NOT kill the concurrently process directly: the unit's
+`Restart=on-failure` would race a manual relaunch on the same port.
+`systemctl restart` is the only restart path. Restarting the unit
+restarts **both** API and web. The API logs its preview reconciliation
+on every start (`[preview] startup reconcile`). Logs: `journalctl -u
+omp-builder.service`.
 
 ### Gua preview app (separate, not a Builder service)
 
 The user's overnight OMP test app "Gua — Plotline" runs its own Vite
 server on `127.0.0.1:4173` from
-`/root/projects/omp-builder/data/projects/4f75505f-a2d9-4cc9-b6f8-4e3978c6de9b`
+`/var/lib/omp-builder/data/projects/4f75505f-a2d9-4cc9-b6f8-4e3978c6de9b`
 (`npx vite --host 0.0.0.0 --port 4173 --strictPort`). **Stop it during
 builds** (it competes for the same 3.8 GB RAM) and restart it after:
 
@@ -69,22 +79,30 @@ builds** (it competes for the same 3.8 GB RAM) and restart it after:
 # (find them with: ps aux | grep "[v]ite --host 0.0.0.0 --port 4173")
 kill <vite-pid> <npm-pid>
 # restart:
-cd /root/projects/omp-builder/data/projects/4f75505f-a2d9-4cc9-b6f8-4e3978c6de9b
-setsid nohup /root/.nvm/versions/node/v22.23.5/bin/npx vite --host 0.0.0.0 --port 4173 --strictPort > /tmp/gua-4173.log 2>&1 < /dev/null &
+cd /var/lib/omp-builder/data/projects/4f75505f-a2d9-4cc9-b6f8-4e3978c6de9b
+setsid nohup /usr/local/node-22.23.5/bin/npx vite --host 0.0.0.0 --port 4173 --strictPort > /tmp/gua-4173.log 2>&1 < /dev/null &
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:4173/
 ```
 
+Note: the 4173 server that was running across the Phase 3.5 §2
+migration still serves from the OLD path
+(`/root/projects/omp-builder/data/projects/4f75505f-…`) until it is
+restarted with the snippet above; its files are identical to the
+migrated copy.
+
 ## Preview architecture (Phase 3C/3D)
 
-1. **Staging sync.** The API (root) mirrors a project's workspace to
+1. **Staging sync.** The API mirrors a project's workspace to
    `/var/lib/omp-builder/previews/<projectId>` (0700, owned by the
    `omp-builder` service user), excluding `node_modules`, `.git`, `.omp`,
    `dist`, `build`, `.next`, `.cache`, `.env*`, `*.pem`, `*.key` and all
    symlinks. Sync runs on preview start/restart and debounced (1.5 s)
    after file saves and OMP `files_modified` events. The live workspace
    is **never** bind-mounted into a container.
-2. **Rootless container.** Run as `omp-builder` via `runuser` (argv
-   arrays, no shell), image `docker.io/library/node:22-alpine`,
+2. **Rootless container.** Run as `omp-builder` (via `runuser` when the
+   API runs as root, directly when it already runs as `omp-builder` —
+   `runuser` refuses non-root callers; see `runPodman` in
+   `apps/api/src/preview.ts`), image `docker.io/library/node:22-alpine`,
    deterministic name `omp-preview-<first-8-of-project-id>`, port
    published to `127.0.0.1` only from 42000–42999 (recorded in the
    `preview_state` table, migration v3). Flags: `--cap-drop=ALL
@@ -130,22 +148,26 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:4173/
 ## Service user + Podman setup (as configured)
 
 - User `omp-builder`, uid **996**, `subuid`/`subgid` `200000:65536`,
-  linger enabled, `user@996.service` active.
+  linger enabled, `user@996.service` active. The API, web server, OMP
+  RPC children, and preview containers all run as this user (Phase 3.5
+  §2). Nothing Builder-related runs as root anymore, except the
+  pre-migration rollback copy (stopped) and the Gua 4173 server.
 - OMP binary for the service user: world-executable copy at
   `/usr/local/bin/omp` (the real binary lives under `/root`, unreachable
-  to `omp-builder`); omp-builder-owned config copy at
-  `/var/lib/omp-builder/omp-config` (its `models.yml` is **not**
-  auto-synced when providers change — resync manually after provider
-  changes; see `docs/SECURITY-REPORT-PHASE3.md`).
-- **OMP-as-service-user is opt-in, not default.** OMP children still
-  spawn as root by default; per-project opt-in via the
-  `OMP_RUN_AS_USER_PROJECT_IDS` env var (comma-separated project ids).
-  Verified working 2026-11-22 on the Phase 2 fixture (session settled,
-  files written owned by omp-builder). No project is currently opted in;
-  the `/root`/repo-root traversal grants used for the verification were
-  reverted. To opt a project in later: set the env var, apply the
-  traversal grants, sync `models.yml` into the user config copy, restart
-  the API.
+  to `omp-builder`); the OMP child config dir is the real config dir
+  (`/var/lib/omp-builder/data/omp-config`, via `OMP_USER_CONFIG_DIR`),
+  so its `models.yml` is always in sync — the 3C manual-resync gap is
+  closed. The old copy at `/var/lib/omp-builder/omp-config` stays on
+  disk, unused.
+- **OMP-as-service-user is the default since Phase 3.5 §2** (was opt-in
+  in 3C). An empty `OMP_RUN_AS_USER_PROJECT_IDS` now means ALL projects;
+  an explicit list still acts as an allowlist. Escape hatch:
+  `OMP_RUN_AS_USER=false` restores root spawn for every project.
+  Because the API itself runs as `omp-builder`, OMP children are
+  spawned directly, not via `runuser` (which refuses non-root callers);
+  the runuser path is kept for the root-run rollback layout. No
+  `/root`/repo-root traversal grants are needed anymore.
+- Node for the service user: `/usr/local/node-22.23.5/bin` (see above).
 
 ## Environment variables
 
@@ -158,14 +180,17 @@ environment win). `.env` is mode **0600**; never print its values.
 | `SESSION_COOKIE_NAME` | `omp_builder_session` | HttpOnly, SameSite=Lax |
 | `SESSION_TTL_DAYS` | `14` | Session lifetime |
 | `SESSION_COOKIE_SECURE` | `false` | Set `true` behind HTTPS |
-| `DATABASE_PATH` | `data/persistent/app.db` | Explicit path must already exist (API refuses to create it) |
-| `PROJECTS_ROOT` | `data/projects` | Workspaces are 0700 root-owned |
-| `OMP_SESSION_ROOT` | `data/omp-sessions` | Per-project OMP session dirs |
-| `OMP_CONFIG_DIR` | `data/omp-config` | OMP config incl. generated `models.yml` |
-| `OMP_BIN` | `omp` | Resolved via PATH; `/root/.local/bin/omp` in dev |
+| `DATABASE_PATH` | `/var/lib/omp-builder/data/persistent/app.db` | Explicit path must already exist (API refuses to create it) |
+| `PROJECTS_ROOT` | `/var/lib/omp-builder/data/projects` | Workspaces are 0700 `omp-builder`-owned |
+| `OMP_SESSION_ROOT` | `/var/lib/omp-builder/data/omp-sessions` | Per-project OMP session dirs, 0700 `omp-builder`-owned |
+| `OMP_CONFIG_DIR` | `/var/lib/omp-builder/data/omp-config` | OMP config incl. generated `models.yml` |
+| `OMP_BIN` | `/usr/local/bin/omp` | Resolved via PATH; must be reachable by `omp-builder` |
+| `OMP_BIN_USER` | `/usr/local/bin/omp` | Binary used for service-user OMP children |
+| `OMP_USER_CONFIG_DIR` | `/var/lib/omp-builder/data/omp-config` | Config dir for service-user OMP children (= real config dir, so `models.yml` stays in sync) |
 | `OMP_MAX_PROCESSES` | `2` | Concurrent OMP children |
 | `OMP_IDLE_MS` | `900000` (15 min) | Idle OMP sessions closed (checked every 60 s) |
-| `OMP_RUN_AS_USER_PROJECT_IDS` | _(empty)_ | Opt-in list for OMP-as-`omp-builder` (see above) |
+| `OMP_RUN_AS_USER` | `true` | `false` restores root spawn for all projects (escape hatch) |
+| `OMP_RUN_AS_USER_PROJECT_IDS` | _(empty = all)_ | Explicit allowlist; empty now means ALL projects (was: none, pre-3.5 §2) |
 | `OMP_MASTER_KEY` | _(required)_ | Base64 32-byte key; AES-256-GCM for provider credentials |
 | `SESSION_SECRET` | _(required)_ | Session signing secret |
 | `WEB_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | CORS allowlist; dev also allows `http://new-lovable.localhost:<port>` |
@@ -175,31 +200,43 @@ environment win). `.env` is mode **0600**; never print its values.
 
 ## Backup and restore
 
-- **Database:** `data/persistent/app.db` (mode **0600** since Phase 3E;
-  `-wal`/`-shm` and the backup files alongside it are 0600 too). Back
+- **Database:** `/var/lib/omp-builder/data/persistent/app.db` (mode
+  **0600**, owned by `omp-builder` since Phase 3.5 §2; `-wal`/`-shm`
+  and the backup files alongside it are 0600 too). Back
   up with a consistent SQLite backup while the API is running, e.g.
   via a `better-sqlite3` online backup (the method used for
   `data/persistent/app.db.backup-20261121` and
   `app.db.backup-provider-attach-1795305986`). Never copy the live file
   with plain `cp` while the API holds it open — use the backup API.
   Verify with `PRAGMA integrity_check` on the copy.
-- **Also back up:** project workspaces (`data/projects/`), OMP session
-  dirs (`data/omp-sessions/`), OMP config (`data/omp-config/`), the
-  service-user config copy (`/var/lib/omp-builder/omp-config`), and
-  `.env` (separately, encrypted — it holds the master key and session
-  secret). Do **not** back up plaintext provider keys or session cookies.
-- **Restore:** stop the API, restore the DB + directories with the same
-  ownership/permissions (workspaces 0700 root, DB 0600 root), start the
-  API, check `/api/health` and the `[preview] startup reconcile` log
-  line. Test restores to a fresh directory before relying on them.
+- **Also back up:** project workspaces (`/var/lib/omp-builder/data/projects/`),
+  OMP session dirs (`/var/lib/omp-builder/data/omp-sessions/`), OMP
+  config (`/var/lib/omp-builder/data/omp-config/`), and `.env`
+  (separately, encrypted — it holds the master key and session secret).
+  Do **not** back up plaintext provider keys or session cookies. The
+  pre-3.5 backup is `/root/omp-builder-backup-phase3.5-20261122.tgz`
+  (+ git bundle of the same name), mode 0600.
+- **Restore:** stop the service (`systemctl stop omp-builder`), restore
+  the DB + directories with the same ownership/permissions (workspaces
+  0700 `omp-builder`, DB 0600 `omp-builder`), start the service, check
+  `/api/health` and the `[preview] startup reconcile` journal line.
+  Test restores to a fresh directory before relying on them.
+- **Rollback to the pre-migration layout:** `systemctl stop
+  omp-builder` (and `disable` if it was enabled), then from
+  `/root/projects/omp-builder` run the old `setsid nohup npm run dev`
+  as root with the nvm Node on PATH (see
+  `docs/MIGRATION-PHASE3.5-2.md`). The old DB is frozen at copy time —
+  anything created after the migration exists only in the new DB.
 - Never delete the data directory during rollback. Migrations are
   additive (`user_version` 3 as of Phase 3); there is no downgrade path
   — keep the previous release directory and the pre-migration DB backup.
 
 ## Production checklist (still open)
 
-- Systemd units for API + web with `Restart=on-failure`,
-  `NoNewPrivileges=yes`, `PrivateTmp=yes`, restricted filesystem policy.
+- Split the single `omp-builder.service` unit into separate API + web
+  units (with `Restart=on-failure`, `NoNewPrivileges=yes`,
+  `PrivateTmp=yes`, restricted filesystem policy). The single unit is
+  the dev workflow under systemd; it is not yet a production split.
 - Caddy (or equivalent) with automatic HTTPS, reverse-proxying to
   `127.0.0.1:8787` with WebSocket upgrades on the same origin.
 - Dedicated preview origin (e.g. `preview-<id>.example.com` with its own
@@ -216,7 +253,7 @@ environment win). `.env` is mode **0600**; never print its values.
 ## Tests
 
 ```sh
-export PATH=/root/.nvm/versions/node/v22.23.5/bin:$PATH
+export PATH=/usr/local/node-22.23.5/bin:$PATH
 npm run typecheck
 NODE_OPTIONS=--max-old-space-size=2560 npm run build
 npm run test:security   # bare command now passes (NODE_OPTIONS baked in)

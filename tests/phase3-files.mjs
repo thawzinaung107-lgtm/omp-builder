@@ -11,8 +11,8 @@ import Database from "better-sqlite3";
 // Env overrides: OMP_BUILDER_API, OMP_BUILDER_DB, OMP_BUILDER_PROJECTS_ROOT.
 
 const api = process.env.OMP_BUILDER_API ?? "http://127.0.0.1:8787";
-const dbPath = process.env.OMP_BUILDER_DB ?? "/root/projects/omp-builder/data/persistent/app.db";
-const projectsRoot = process.env.OMP_BUILDER_PROJECTS_ROOT ?? "/root/projects/omp-builder/data/projects";
+const dbPath = process.env.OMP_BUILDER_DB ?? "/var/lib/omp-builder/data/persistent/app.db";
+const projectsRoot = process.env.OMP_BUILDER_PROJECTS_ROOT ?? "/var/lib/omp-builder/data/projects";
 const ADMIN_ID = "155e3283-d271-452a-af52-e90f900cd78d";
 const PHASE2_ID = "134cc3fe-631f-4755-9839-67af3bfd8ba9";
 const GUA_ID = "4f75505f-a2d9-4cc9-b6f8-4e3978c6de9b";
