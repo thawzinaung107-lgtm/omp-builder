@@ -1,0 +1,25 @@
+{
+  "name": "omp-builder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted web application builder powered exclusively by Oh My Pi",
+  "type": "module",
+  "workspaces": ["apps/*", "packages/*"],
+  "overrides": {
+    "dompurify": "^3.4.13"
+  },
+  "scripts": {
+    "dev": "concurrently --kill-others-on-fail --success=first \"npm run dev --workspace @omp-builder/api\" \"npm run dev --workspace @omp-builder/web\"",
+    "build": "npm run build --workspace @omp-builder/shared && npm run build --workspace @omp-builder/api && npm run build --workspace @omp-builder/web",
+    "typecheck": "npm run build --workspace @omp-builder/shared && npm run typecheck --workspaces --if-present",
+    "test:security": "npm run build && node tests/security-regression.mjs",
+    "test:rpc": "npm run build --workspace @omp-builder/api && node tests/omp-rpc-smoke.mjs",
+    "admin:reset": "node scripts/reset-admin.mjs",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3"
+  }
+}

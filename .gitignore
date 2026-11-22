@@ -1,0 +1,27 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+data/*.db
+data/persistent/
+*.log
+.DS_Store
+
+# Local secrets and test data
+.env
+.env.*
+!.env.example
+cookies.txt
+data-smoke/
+node_modules/
+dist/
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.log
+
+# Runtime data (workspaces, sessions, provider config, databases)
+data/
