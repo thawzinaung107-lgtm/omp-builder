@@ -1,5 +1,5 @@
-const workspaceTabs = ["preview", "code", "files", "logs", "git"] as const;
-export const mobileTabs = ["chat", "preview", "code", "files"] as const;
+const workspaceTabs = ["preview", "code", "files", "problems", "logs", "git"] as const;
+export const mobileTabs = ["chat", "preview", "code", "files", "problems"] as const;
 const previewDevices = ["desktop", "mobile"] as const;
 
 export type WorkspaceTab = (typeof workspaceTabs)[number];

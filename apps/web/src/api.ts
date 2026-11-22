@@ -1,4 +1,4 @@
-import type { OmpEvent, Project, Provider, PublicUser, SessionEvent } from "@omp-builder/shared";
+import type { OmpEvent, PreviewProblems, Project, Provider, PublicUser, SessionEvent } from "@omp-builder/shared";
 
 /** Error thrown by `request` — carries the HTTP status so callers can
  * distinguish e.g. a 409 edit conflict from other failures. */
@@ -87,6 +87,8 @@ export const api = {
     request<{ preview: PreviewState | null }>(`/api/projects/${encodeURIComponent(projectId)}/preview/stop`, { method: "POST" }),
   previewRestart: (projectId: string) =>
     request<{ preview: PreviewState }>(`/api/projects/${encodeURIComponent(projectId)}/preview/restart`, { method: "POST" }),
+  previewProblems: (projectId: string, signal?: AbortSignal) =>
+    request<PreviewProblems>(`/api/projects/${encodeURIComponent(projectId)}/preview/problems`, { signal, cache: "no-store" }),
   previewLogs: (projectId: string, tail = 200) =>
     request<{ running: boolean; logs: string }>(`/api/projects/${encodeURIComponent(projectId)}/preview/logs?tail=${tail}`),
 };
