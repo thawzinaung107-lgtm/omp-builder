@@ -30,3 +30,20 @@ export const sessionEventSchema = z.object({ type: z.string(), message: z.string
 export type SessionEvent = z.infer<typeof sessionEventSchema>;
 
 export type BrowserCommand = { type: "prompt"; message: string } | { type: "abort" } | { type: "replay"; afterEventId?: number } | { type: "set_model"; provider: string; modelId: string };
+
+export type PreviewProblem = {
+  id: string;
+  severity: "error" | "warning";
+  kind: "dependency" | "startup" | "compile" | "runtime";
+  summary: string;
+  detail: string;
+  location?: { path: string; line: number; column?: number };
+  stale: boolean;
+};
+
+export type PreviewProblems = {
+  runId: string | null;
+  phase: "idle" | "starting" | "running" | "failed" | "stopped";
+  problems: PreviewProblem[];
+  logs: string;
+};

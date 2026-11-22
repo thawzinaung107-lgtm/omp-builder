@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
@@ -13,6 +13,9 @@ const allowedOrigin = "http://new-lovable.localhost:33295";
 const changedOrigin = "http://new-lovable.localhost:45025";
 const env = { ...process.env, API_HOST: "127.0.0.1", API_PORT: String(port), WEB_ORIGINS: "http://localhost:5173", DEV_DYNAMIC_FORWARD_ORIGIN: "true", DATABASE_PATH: path.join(temp, "app.db"), PROJECTS_ROOT: path.join(temp, "projects"), OMP_SESSION_ROOT: path.join(temp, "sessions"), OMP_CONFIG_DIR: path.join(temp, "config"), OMP_MASTER_KEY: Buffer.alloc(32, 7).toString("base64"), OMP_BIN: "/usr/local/bin/omp" };
 new Database(env.DATABASE_PATH).close();
+// A regular file cannot be a staging root: deterministic runtime preparation failure.
+env.PREVIEW_ROOT = path.join(temp, "unusable-preview-root");
+await writeFile(env.PREVIEW_ROOT, "fixture");
 const missingEnv = { ...env, API_PORT: String(port + 2), DATABASE_PATH: path.join(temp, "missing", "app.db") };
 const missing = spawn(process.execPath, [path.join(root, "apps/api/dist/server.js")], { cwd: "/tmp", env: missingEnv, stdio: ["ignore", "pipe", "pipe"] });
 let missingError = "";
@@ -62,6 +65,28 @@ try {
   assert.equal(setup.status, 201);
   const cookie = setup.headers.get("set-cookie").split(";", 1)[0];
   const headers = { cookie, Origin: allowedOrigin, "content-type": "application/json" };
+  async function createDiagnosticProject(name) {
+    const response = await fetch(`http://127.0.0.1:${port}/api/projects`, { method: "POST", headers, body: JSON.stringify({ name, prompt: "Disposable diagnostic test" }) });
+    assert.equal(response.status, 201);
+    return (await response.json()).project.id;
+  }
+  const firstProject = await createDiagnosticProject("A4 diagnostic fixture");
+  const secondProject = await createDiagnosticProject("A4 isolation fixture");
+  const previewUrl = (project, route) => `http://127.0.0.1:${port}/api/projects/${project}/preview/${route}`;
+  assert.equal((await fetch(previewUrl(firstProject, "problems"))).status, 401);
+  const failedPreview = await fetch(previewUrl(firstProject, "start"), { method: "POST", headers });
+  assert.equal(failedPreview.status, 500);
+  assert.doesNotMatch(await failedPreview.text(), /unusable-preview-root|\/tmp/);
+  const firstProblems = await (await fetch(previewUrl(firstProject, "problems"), { headers })).json();
+  const secondProblems = await (await fetch(previewUrl(secondProject, "problems"), { headers })).json();
+  assert.equal(firstProblems.phase, "failed");
+  assert.equal(firstProblems.problems[0].kind, "runtime");
+  assert.doesNotMatch(JSON.stringify(firstProblems), /unusable-preview-root|\/tmp/);
+  assert.equal(secondProblems.runId, null);
+  assert.deepEqual(secondProblems.problems, []);
+  await fetch(previewUrl(firstProject, "restart"), { method: "POST", headers });
+  const restartedProblems = await (await fetch(previewUrl(firstProject, "problems"), { headers })).json();
+  assert.notEqual(restartedProblems.runId, firstProblems.runId);
   const rejected = await fetch(`http://127.0.0.1:${port}/api/providers`, { method: "POST", headers, body: JSON.stringify({ providerId: "private", baseUrl: "http://10.0.0.1/v1", api: "openai-completions", modelId: "model", displayName: "Private", apiKey: "do-not-store-in-plaintext" }) });
   assert.equal(rejected.status, 500);
   const local = await fetch(`http://127.0.0.1:${port}/api/providers`, { method: "POST", headers, body: JSON.stringify({ providerId: "local", baseUrl: "http://localhost:11434/v1", api: "openai-completions", modelId: "model", displayName: "Local", apiKey: secret }) });
