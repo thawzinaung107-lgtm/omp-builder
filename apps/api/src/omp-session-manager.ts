@@ -6,7 +6,7 @@ type SessionRecord = { session: OmpRpcSession; lastUsed: number };
 
 export class OmpSessionManager {
   private sessions = new Map<string, SessionRecord>();
-  constructor(private readonly options: { binary: string; projectsRoot: string; sessionRoot: string; maxProcesses: number; idleMs: number }) {
+  constructor(private readonly options: { binary: string; projectsRoot: string; sessionRoot: string; maxProcesses: number; idleMs: number; runAsUserFor?: (projectId: string) => boolean }) {
     mkdirSync(options.sessionRoot, { recursive: true, mode: 0o700 });
     this.options.binary = resolveOmpBinary(options.binary);
   }
@@ -14,7 +14,7 @@ export class OmpSessionManager {
     let current = this.sessions.get(project.id);
     if (current) { current.lastUsed = Date.now(); return current.session; }
     if (this.sessions.size >= this.options.maxProcesses) throw new Error("OMP process limit reached");
-    const session = new OmpRpcSession({ projectId: project.id, cwd: project.workspacePath, sessionDir: path.join(this.options.sessionRoot, project.id), binary: this.options.binary, provider: project.provider, modelId: project.modelId, resume: true, env }, { onEvent, onExit });
+    const session = new OmpRpcSession({ projectId: project.id, cwd: project.workspacePath, sessionDir: path.join(this.options.sessionRoot, project.id), binary: this.options.binary, provider: project.provider, modelId: project.modelId, resume: true, env, runAsUser: this.options.runAsUserFor?.(project.id) ?? false }, { onEvent, onExit });
     current = { session, lastUsed: Date.now() }; this.sessions.set(project.id, current);
     try { await session.start(); } catch (error) { this.sessions.delete(project.id); await session.close(); throw error; }
     return session;

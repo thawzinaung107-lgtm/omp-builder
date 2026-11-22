@@ -63,6 +63,10 @@ export const config = {
   ompBinary: process.env.OMP_BIN ?? "omp",
   ompMaxProcesses: Math.max(1, Number(process.env.OMP_MAX_PROCESSES ?? 2)),
   ompIdleMs: Math.max(1_000, Number(process.env.OMP_IDLE_MS ?? 900_000)),
+  // Phase 3C experiment (brief §6): OMP RPC children for these project ids
+  // run as the omp-builder service user via runuser instead of root.
+  // Empty by default — root spawn is unchanged unless explicitly opted in.
+  ompRunAsUserProjectIds: new Set((process.env.OMP_RUN_AS_USER_PROJECT_IDS ?? "").split(",").map((entry) => entry.trim()).filter(Boolean)),
   allowedOrigins,
   devForwardHost,
   devForwardPort,

@@ -30,6 +30,17 @@ export type FileTreeEntry = {
 
 export type FileContent = { path: string; content: string; size: number; mtime: string; mtimeMs: number };
 
+export type PreviewState = {
+  projectId: string;
+  containerName: string;
+  hostPort: number;
+  containerPort: number;
+  framework: "vite" | "static";
+  status: "starting" | "running" | "stopped" | "crashed" | "error";
+  lastError: string | null;
+  updatedAt: string;
+};
+
 export const api = {
   authStatus: () => request<{ setupRequired: boolean; user: PublicUser | null }>("/api/auth/status"),
   setup: (email: string, password: string) => request<{ user: PublicUser }>("/api/auth/setup", { method: "POST", body: JSON.stringify({ email, password }) }),
@@ -66,4 +77,16 @@ export const api = {
       method: "DELETE",
       body: JSON.stringify({ path, ...(recursive === undefined ? {} : { recursive }) }),
     }),
+  // Phase 3D — managed previews (the gateway is the only way a preview is
+  // viewed; there is no manual URL anymore).
+  previewStatus: (projectId: string) =>
+    request<{ preview: PreviewState | null }>(`/api/projects/${encodeURIComponent(projectId)}/preview/status`),
+  previewStart: (projectId: string) =>
+    request<{ preview: PreviewState }>(`/api/projects/${encodeURIComponent(projectId)}/preview/start`, { method: "POST" }),
+  previewStop: (projectId: string) =>
+    request<{ preview: PreviewState | null }>(`/api/projects/${encodeURIComponent(projectId)}/preview/stop`, { method: "POST" }),
+  previewRestart: (projectId: string) =>
+    request<{ preview: PreviewState }>(`/api/projects/${encodeURIComponent(projectId)}/preview/restart`, { method: "POST" }),
+  previewLogs: (projectId: string, tail = 200) =>
+    request<{ running: boolean; logs: string }>(`/api/projects/${encodeURIComponent(projectId)}/preview/logs?tail=${tail}`),
 };

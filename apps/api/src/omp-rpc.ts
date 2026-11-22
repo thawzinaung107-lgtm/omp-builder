@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { accessSync, constants as fsConstants, mkdirSync } from "node:fs";
+import { accessSync, constants as fsConstants, chownSync, mkdirSync, readFileSync } from "node:fs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { OmpEvent } from "@omp-builder/shared";
@@ -18,7 +18,7 @@ function safePayload(value: unknown): Record<string, unknown> {
   return result && typeof result === "object" && !Array.isArray(result) ? result as Record<string, unknown> : { value: result };
 }
 
-export type OmpSessionOptions = { projectId: string; cwd: string; sessionDir: string; binary: string; provider?: string; modelId?: string; resume?: boolean; env?: NodeJS.ProcessEnv };
+export type OmpSessionOptions = { projectId: string; cwd: string; sessionDir: string; binary: string; provider?: string; modelId?: string; resume?: boolean; env?: NodeJS.ProcessEnv; runAsUser?: boolean };
 const ISOLATED_CREDENTIAL_ENV = /^(?:OMP_BUILDER_KEY_|(?:XPIKI|OPENAI|ANTHROPIC|GOOGLE|GEMINI|DEEPSEEK|OPENROUTER|MISTRAL|GROQ|TOGETHER|FIREWORKS|COHERE|PERPLEXITY|AZURE|AWS)_API_KEY$|(?:API_KEY|API_TOKEN|AUTH_TOKEN))$/i;
 
 function childEnvironment(overrides: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
@@ -29,6 +29,17 @@ export function resolveOmpBinary(binary: string): string {
   const candidates = binary.includes("/") ? [binary] : [...(process.env.PATH ?? "").split(":").filter(Boolean).map((directory) => `${directory}/${binary}`), `${process.env.HOME ?? ""}/.local/bin/${binary}`];
   for (const candidate of candidates) { try { accessSync(candidate, fsConstants.X_OK); return candidate; } catch { /* try the next configured location */ } }
   throw new Error(`OMP executable not found: ${binary}`);
+}
+
+/** Resolve the omp-builder service user's uid/gid from /etc/passwd. */
+function serviceUserIds(): { uid: number; gid: number } {
+  const line = readFileSync("/etc/passwd", "utf8").split("\n").find((entry) => entry.startsWith("omp-builder:"));
+  if (!line) throw new Error("Service user omp-builder not found in /etc/passwd");
+  const fields = line.split(":");
+  const uid = Number(fields[2]);
+  const gid = Number(fields[3]);
+  if (!Number.isInteger(uid) || !Number.isInteger(gid)) throw new Error("Cannot parse uid/gid for omp-builder");
+  return { uid, gid };
 }
 export type OmpSessionCallbacks = { onEvent: (type: OmpEvent["type"], payload: Record<string, unknown>) => void; onExit: (error?: Error) => void };
 
@@ -52,10 +63,54 @@ export class OmpRpcSession {
     const binary = resolveOmpBinary(this.options.binary);
     mkdirSync(this.options.sessionDir, { recursive: true, mode: 0o700 });
     mkdirSync(this.options.cwd, { recursive: true, mode: 0o700 });
+    if (this.options.runAsUser) {
+      // The API creates these dirs as root on first use; the service user
+      // needs to own them or OMP fails with EACCES on chdir/mkdir. Top
+      // dirs only — OMP creates its own subdirs. (For a pre-existing
+      // project with root-owned workspace files, a one-time recursive
+      // chown of the workspace is still an operator step; see the 3C report.)
+      const { uid, gid } = serviceUserIds();
+      chownSync(this.options.sessionDir, uid, gid);
+      chownSync(this.options.cwd, uid, gid);
+    }
     const args = ["--mode", "rpc", "--no-ui", "--no-extensions", "--no-skills", "--no-rules", "--no-context-files", "--cwd", this.options.cwd, "--session-dir", this.options.sessionDir];
     if (this.options.resume) args.push("--continue");
     if (this.options.provider && this.options.modelId) args.push("--model", `${this.options.provider}/${this.options.modelId}`);
-    this.child = spawn(binary, args, { cwd: this.options.cwd, stdio: ["pipe", "pipe", "pipe"], env: childEnvironment(this.options.env) });
+    const childEnv = childEnvironment(this.options.env);
+    if (this.options.runAsUser) {
+      // Phase 3C experiment (brief §6): run the OMP child as the
+      // omp-builder service user via runuser. Argv arrays only — no shell.
+      // The OMP binary lives under /root (unreachable to omp-builder), so
+      // a world-executable copy at OMP_BIN_USER is used instead; the OMP
+      // config dir is the omp-builder-owned copy at OMP_USER_CONFIG_DIR
+      // (its models.yml must be kept in sync with the real config dir —
+      // see the Phase 3C report). HOME/XDG point at the service user's
+      // own directories. The project workspace + session dir must already
+      // be owned by omp-builder. Falls back to root spawn unless the
+      // project is opted in via OMP_RUN_AS_USER_PROJECT_IDS.
+      const userBinary = process.env.OMP_BIN_USER ?? "/usr/local/bin/omp";
+      const userConfigDir = process.env.OMP_USER_CONFIG_DIR ?? "/var/lib/omp-builder/omp-config";
+      // The environment MUST be passed via spawn's `env` option (execve
+      // environ), never as `/usr/bin/env KEY=VALUE ...` argv: argv shows up
+      // in ps / /proc/<pid>/cmdline world-readable, which would leak the
+      // decrypted provider keys for the whole session lifetime. runuser
+      // preserves the caller's environment for the child (verified
+      // 2026-11-22: custom vars and values with spaces pass through, and
+      // runuser itself sets HOME/USER/LOGNAME to the target user).
+      this.child = spawn("/usr/sbin/runuser", ["-u", "omp-builder", "--", userBinary, ...args], {
+        cwd: this.options.cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...childEnv,
+          HOME: "/var/lib/omp-builder",
+          XDG_RUNTIME_DIR: "/run/user/996",
+          OMP_CONFIG_DIR: userConfigDir,
+          PI_CODING_AGENT_DIR: userConfigDir,
+        },
+      });
+    } else {
+      this.child = spawn(binary, args, { cwd: this.options.cwd, stdio: ["pipe", "pipe", "pipe"], env: childEnv });
+    }
     this.child.stderr.on("data", (chunk) => { const message = String(chunk).trim(); if (message) this.callbacks.onEvent("session_status", { state: "stderr", message: message.slice(0, 500) }); });
     const lines = createInterface({ input: this.child.stdout });
     lines.on("line", (line) => this.receive(line));

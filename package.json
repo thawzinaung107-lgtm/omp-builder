@@ -12,7 +12,7 @@
     "dev": "concurrently --kill-others-on-fail --success=first \"npm run dev --workspace @omp-builder/api\" \"npm run dev --workspace @omp-builder/web\"",
     "build": "npm run build --workspace @omp-builder/shared && npm run build --workspace @omp-builder/api && npm run build --workspace @omp-builder/web",
     "typecheck": "npm run build --workspace @omp-builder/shared && npm run typecheck --workspaces --if-present",
-    "test:security": "npm run build && node tests/security-regression.mjs",
+    "test:security": "NODE_OPTIONS=--max-old-space-size=2560 npm run build && node tests/security-regression.mjs",
     "test:rpc": "npm run build --workspace @omp-builder/api && node tests/omp-rpc-smoke.mjs",
     "admin:reset": "node scripts/reset-admin.mjs",
     "format": "prettier --write ."

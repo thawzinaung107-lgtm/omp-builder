@@ -21,7 +21,7 @@ export const providerSchema = z.object({
 export type Provider = z.infer<typeof providerSchema>;
 
 export const ompEventSchema = z.object({
-  id: z.number().int().nonnegative(), projectId: z.string().uuid(), type: z.enum(["session_status", "prompt_accepted", "assistant_delta", "assistant_completed", "tool_started", "tool_progress", "tool_finished", "tool_error", "files_modified", "model_changed", "prompt_aborted", "agent_error", "session_settled"]),
+  id: z.number().int().nonnegative(), projectId: z.string().uuid(), type: z.enum(["session_status", "prompt_accepted", "assistant_delta", "assistant_completed", "tool_started", "tool_progress", "tool_finished", "tool_error", "files_modified", "model_changed", "prompt_aborted", "agent_error", "session_settled", "preview_log", "preview_status"]),
   payload: z.record(z.string(), z.unknown()), createdAt: z.string(),
 });
 export type OmpEvent = z.infer<typeof ompEventSchema>;

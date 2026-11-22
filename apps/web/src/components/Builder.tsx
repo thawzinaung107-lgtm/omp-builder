@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ArrowUp, ChevronDown, Code2, ExternalLink, Folder, GitBranch, LayoutDashboard, MessageSquare, MoreHorizontal, Play, RefreshCw, RotateCcw, Settings2, SplitSquareHorizontal, Terminal, X } from "lucide-react";
 import type { BrowserCommand, Project, Provider, SessionEvent } from "@omp-builder/shared";
-import { api, ApiError } from "../api";
+import { api, ApiError, type PreviewState } from "../api";
 import { Button, StatusChip, timeAgo } from "../ui";
 import { FileExplorer } from "./FileExplorer";
 import { MonacoEditor } from "./MonacoEditor";
@@ -92,8 +92,16 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
   const [notice, setNotice] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [attachNote, setAttachNote] = useState(false);
-  const [previewUrl, setPreviewUrl] = useState(() => localStorage.getItem(`omp-builder-preview-url:${project.id}`) ?? "");
-  const [previewDraft, setPreviewDraft] = useState(previewUrl);
+  // Phase 3D — managed preview (gateway only; the manual URL bar and the
+  // localStorage preview URL are gone). `previewRef` mirrors the state for
+  // the stable WebSocket `preview_status` handler.
+  const [preview, setPreview] = useState<PreviewState | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const previewRef = useRef<PreviewState | null>(null);
+  useEffect(() => {
+    previewRef.current = preview;
+  }, [preview]);
   const [device, setDevice] = useState<"desktop" | "mobile">("desktop");
   const [frameKey, setFrameKey] = useState(0);
   const socketRef = useRef<WebSocket | undefined>(undefined);
@@ -103,25 +111,37 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
   const activeAssistantId = useRef<string | undefined>(undefined);
   const stopped = useRef(false);
 
-  // Pasted URLs often have no scheme ("host:4173") — an iframe with no
-  // scheme fails with ERR_UNKNOWN_URL_SCHEME, so assume http://.
-  function normalizePreviewUrl(value: string): string {
-    const url = value.trim();
-    if (!url) return "";
-    return /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `http://${url}`;
-  }
+  // Phase 3D — the preview is served only through the authenticated
+  // gateway at this relative URL (same origin as the Builder, via the dev
+  // proxy in development). Never a container port, never user-entered.
+  const gatewayUrl = `/api/preview/${project.id}/`;
 
-  const savePreviewUrl = (value: string) => {
-    const url = normalizePreviewUrl(value);
-    setPreviewUrl(url);
-    setPreviewDraft(url);
-    if (url) localStorage.setItem(`omp-builder-preview-url:${project.id}`, url);
-    else localStorage.removeItem(`omp-builder-preview-url:${project.id}`);
-  };
+  const loadPreviewStatus = useCallback(async () => {
+    try {
+      const result = await api.previewStatus(project.id);
+      setPreview(result.preview);
+    } catch {
+      setPreview(null);
+    }
+  }, [project.id]);
 
-  // Normalize at use time too, so a scheme-less URL saved before this
-  // fix still loads without the user re-pasting it.
-  const previewSrc = normalizePreviewUrl(previewUrl);
+  const previewAction = useCallback(
+    async (action: "start" | "stop" | "restart") => {
+      setPreviewBusy(true);
+      setPreviewError("");
+      try {
+        const result =
+          action === "start" ? await api.previewStart(project.id) : action === "stop" ? await api.previewStop(project.id) : await api.previewRestart(project.id);
+        setPreview(result.preview);
+        if (action !== "stop") setFrameKey((k) => k + 1);
+      } catch (err) {
+        setPreviewError(err instanceof Error ? err.message : "Preview action failed");
+      } finally {
+        setPreviewBusy(false);
+      }
+    },
+    [project.id],
+  );
 
   // Phase 3B — editor actions.
   const openFile = useCallback(
@@ -233,7 +253,11 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
 
   const handleEvent = useCallback((event: SessionEvent) => {
     if (event.eventId !== undefined) lastEventId.current = Math.max(lastEventId.current ?? 0, event.eventId);
-    setEvents((current) => (event.eventId !== undefined && current.some((e) => e.eventId === event.eventId) ? current : [...current, event]));
+    // Cap the in-memory list: a long-running preview can emit hundreds of
+    // preview_log lines; the DB already caps persisted logs at 200/project.
+    setEvents((current) =>
+      event.eventId !== undefined && current.some((e) => e.eventId === event.eventId) ? current : [...current, event].slice(-500),
+    );
     const text = eventText(event);
     const payload = event.payload ?? {};
     if (event.type === "assistant_delta") {
@@ -297,12 +321,37 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
       setSettled(true);
       return;
     }
+    // Phase 3D — preview lifecycle. The payload carries the new status;
+    // refresh from the API when we have no state yet (e.g. a replayed
+    // event from before this tab mounted).
+    if (event.type === "preview_status") {
+      const status = typeof payload.status === "string" ? payload.status : "";
+      if (["starting", "running", "stopped", "crashed", "error"].includes(status)) {
+        if (!previewRef.current) void loadPreviewStatus();
+        else {
+          setPreview((current) =>
+            current
+              ? {
+                  ...current,
+                  status: status as PreviewState["status"],
+                  ...(typeof payload.lastError === "string" || payload.lastError === null ? { lastError: payload.lastError as string | null } : {}),
+                  ...(typeof payload.hostPort === "number" ? { hostPort: payload.hostPort } : {}),
+                  ...(typeof payload.framework === "string" ? { framework: payload.framework as PreviewState["framework"] } : {}),
+                }
+              : current,
+          );
+        }
+      }
+      return;
+    }
+    // Phase 3D — preview_log events need no special handling here; they
+    // land in `events` and the Logs tab renders them as runtime logs.
     if (["session_settled", "prompt_aborted", "agent_error"].includes(event.type)) setWorking(false);
     if (event.type === "session_settled") setSettled(true);
     if (event.type === "agent_error") setError(text);
     if (event.type === "session_status" || event.type === "model_changed")
       setItems((current) => [...current, { id: `${event.type}-${event.eventId ?? Date.now()}`, role: "status", text }]);
-  }, [handleExternalChanges]);
+  }, [handleExternalChanges, loadPreviewStatus]);
 
   useEffect(() => {
     let alive = true;
@@ -327,10 +376,12 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
         });
       })
       .catch(() => undefined);
+    // Phase 3D — current preview state for the managed Preview tab.
+    void loadPreviewStatus();
     return () => {
       alive = false;
     };
-  }, [project.id, handleEvent]);
+  }, [project.id, handleEvent, loadPreviewStatus]);
 
   useEffect(() => {
     stopped.current = false;
@@ -522,31 +573,42 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
     </form>
   );
 
+  // Phase 3D — managed preview. The iframe loads ONLY through the
+  // authenticated gateway (never a container port, never a pasted URL), and
+  // its sandbox has NO allow-same-origin: the generated page runs in an
+  // opaque origin, so its JavaScript cannot read the admin session cookie
+  // or call Builder APIs with it.
+  const previewStatusLabel = preview ? preview.status : "stopped";
+  const previewStatusTone =
+    previewStatusLabel === "running"
+      ? "bg-[#e3f7f0] text-omp-success"
+      : previewStatusLabel === "starting"
+        ? "bg-[#fef3e2] text-[#9a6b12]"
+        : previewStatusLabel === "crashed" || previewStatusLabel === "error"
+          ? "bg-[#fdecec] text-[#a83232]"
+          : "bg-[#edf0f6] text-omp-muted";
   const previewPanel = (
     <div className="flex min-h-0 flex-1 flex-col">
-      {/* Browser bar */}
+      {/* Browser bar — gateway URL is shown read-only, never editable */}
       <div className="flex shrink-0 items-center gap-2 border-b border-omp-border bg-white px-3 py-2.5">
         <span className="flex items-center gap-1.5">
           <span className="h-2.5 w-2.5 rounded-full bg-[#e8eaf2]" />
           <span className="h-2.5 w-2.5 rounded-full bg-[#e8eaf2]" />
           <span className="h-2.5 w-2.5 rounded-full bg-[#e8eaf2]" />
         </span>
-        <button type="button" onClick={() => setFrameKey((k) => k + 1)} className="rounded-md p-1.5 text-omp-muted hover:bg-omp-canvas" aria-label="Refresh preview" title="Refresh preview">
+        <button
+          type="button"
+          onClick={() => setFrameKey((k) => k + 1)}
+          disabled={preview?.status !== "running"}
+          className="rounded-md p-1.5 text-omp-muted hover:bg-omp-canvas disabled:opacity-40"
+          aria-label="Refresh preview"
+          title="Refresh preview"
+        >
           <RefreshCw size={14} />
         </button>
-        <input
-          value={previewDraft}
-          onChange={(event) => setPreviewDraft(event.target.value)}
-          onBlur={() => savePreviewUrl(previewDraft)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              event.currentTarget.blur();
-            }
-          }}
-          placeholder="Paste the preview URL, e.g. http://localhost:4173"
-          className="min-w-0 flex-1 rounded-omp border border-omp-border bg-omp-canvas px-3 py-1.5 text-xs text-omp-ink outline-none placeholder:text-omp-muted/70 focus:border-omp-brand"
-          aria-label="Preview URL"
-        />
+        <span className="min-w-0 flex-1 truncate rounded-omp border border-omp-border bg-omp-canvas px-3 py-1.5 font-mono text-xs text-omp-muted" title={gatewayUrl}>
+          {gatewayUrl}
+        </span>
         <select
           value={device}
           onChange={(event) => setDevice(event.target.value as "desktop" | "mobile")}
@@ -558,8 +620,8 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
         </select>
         <button
           type="button"
-          onClick={() => previewSrc && window.open(previewSrc, "_blank", "noopener")}
-          disabled={!previewUrl}
+          onClick={() => preview?.status === "running" && window.open(gatewayUrl, "_blank", "noopener")}
+          disabled={preview?.status !== "running"}
           className="rounded-md p-1.5 text-omp-muted hover:bg-omp-canvas disabled:opacity-40"
           aria-label="Open preview in a new tab"
           title="Open preview in a new tab"
@@ -567,14 +629,43 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
           <ExternalLink size={14} />
         </button>
       </div>
+      {/* Preview controls */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-omp-border bg-white px-3 py-2.5">
+        <span className={`rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${previewStatusTone}`}>{previewStatusLabel}</span>
+        {preview && (
+          <span className="text-xs text-omp-muted">
+            {preview.framework === "vite" ? "Vite dev server" : "Static site"}
+            {preview.status === "running" ? ` • container port ${preview.containerPort}` : ""}
+          </span>
+        )}
+        <span className="ml-auto flex items-center gap-2">
+          <Button variant="outline" className="!px-3 !py-1.5 !text-xs" disabled={previewBusy || preview?.status === "running" || preview?.status === "starting"} onClick={() => void previewAction("start")}>
+            <Play size={13} /> Start
+          </Button>
+          <Button variant="outline" className="!px-3 !py-1.5 !text-xs" disabled={previewBusy || preview?.status !== "running"} onClick={() => void previewAction("restart")}>
+            <RotateCcw size={13} /> Restart
+          </Button>
+          <Button variant="outline" className="!px-3 !py-1.5 !text-xs" disabled={previewBusy || (preview?.status !== "running" && preview?.status !== "starting")} onClick={() => void previewAction("stop")}>
+            <X size={13} /> Stop
+          </Button>
+        </span>
+      </div>
+      {previewError && (
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[#f6c6c6] bg-[#fdecec] px-4 py-2 text-xs text-[#a83232]">
+          <span>{previewError}</span>
+          <button type="button" onClick={() => setPreviewError("")} aria-label="Dismiss" className="text-[#a83232] hover:text-omp-ink">
+            <X size={14} />
+          </button>
+        </div>
+      )}
       {/* Preview body */}
       <div className="flex min-h-0 flex-1 items-stretch justify-center overflow-y-auto bg-omp-canvas p-3 md:p-4">
-        {previewUrl ? (
+        {preview?.status === "running" ? (
           <iframe
-            key={`${previewSrc}-${frameKey}`}
+            key={`${gatewayUrl}-${frameKey}`}
             title={`${project.name} preview`}
-            src={previewSrc}
-            sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+            src={gatewayUrl}
+            sandbox="allow-scripts allow-forms allow-popups"
             className={`min-h-[480px] w-full rounded-omp border border-omp-border bg-white shadow-sm ${device === "mobile" ? "max-w-[390px]" : ""}`}
           />
         ) : (
@@ -583,19 +674,16 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
               <div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl bg-omp-brandSubtle text-omp-brand">
                 <Play size={20} />
               </div>
-              <h3 className="font-semibold text-omp-ink">No preview URL yet</h3>
+              <h3 className="font-semibold text-omp-ink">{preview?.status === "starting" ? "Preview is starting…" : preview?.status === "crashed" || preview?.status === "error" ? "Preview crashed" : "Preview is stopped"}</h3>
               <p className="mx-auto mt-1.5 max-w-sm text-sm leading-6 text-omp-muted">
-                Ask OMP to start the dev server, then paste its URL in the address bar above. The URL is stored only in this browser.
+                {preview?.status === "starting"
+                  ? "The preview container is starting. It appears here automatically once it is ready."
+                  : preview?.status === "crashed" || preview?.status === "error"
+                    ? (preview.lastError ?? "The preview container exited unexpectedly. Check the runtime logs, then restart it.")
+                    : "Start the preview to run this project in an isolated container and view it here through the secure gateway."}
               </p>
-              <Button
-                variant="outline"
-                className="mt-4"
-                onClick={() => {
-                  setChat("Start the preview dev server and tell me its URL.");
-                  setMobileTab("chat");
-                }}
-              >
-                Ask OMP to start the preview
+              <Button variant="outline" className="mt-4" disabled={previewBusy || preview?.status === "starting"} onClick={() => void previewAction(preview?.status === "crashed" || preview?.status === "error" ? "restart" : "start")}>
+                {previewBusy || preview?.status === "starting" ? "Starting…" : preview?.status === "crashed" || preview?.status === "error" ? "Restart preview" : "Start preview"}
               </Button>
             </div>
           </div>
@@ -603,10 +691,10 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
       </div>
       <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-t border-omp-border bg-white px-4 py-2.5 text-xs text-omp-muted">
         <span className="flex items-center gap-1.5">
-          <span className={`h-2 w-2 rounded-full ${previewUrl ? "bg-omp-success" : "bg-[#a2aabe]"}`} />
-          {previewUrl ? "Preview running" : "Preview not configured"}
+          <span className={`h-2 w-2 rounded-full ${preview?.status === "running" ? "bg-omp-success" : preview?.status === "starting" ? "bg-[#e8a13a]" : "bg-[#a2aabe]"}`} />
+          {preview?.status === "running" ? "Preview running via secure gateway" : "Preview not running"}
         </span>
-        <span>React + Vite</span>
+        <span>{preview ? (preview.framework === "vite" ? "React + Vite" : "Static site") : "No preview yet"}</span>
         <button type="button" onClick={() => setTab("code")} className="ml-auto font-medium text-omp-brand hover:underline">
           Open in editor ↗
         </button>
@@ -614,14 +702,55 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
     </div>
   );
 
+  // Phase 3D — Logs tab: runtime logs (preview_log / preview_status) in
+  // their own auto-scrolling section, newest at the bottom, capped at the
+  // latest 100 lines; session events below, unchanged.
+  const runtimeEvents = useMemo(() => events.filter((event) => event.type === "preview_log" || event.type === "preview_status"), [events]);
+  const sessionEvents = useMemo(() => events.filter((event) => event.type !== "preview_log" && event.type !== "preview_status"), [events]);
+  const runtimeLogRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = runtimeLogRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [runtimeEvents]);
+  const runtimeText = (event: SessionEvent): string => {
+    const payload = event.payload ?? {};
+    if (event.type === "preview_log") return typeof payload.line === "string" ? payload.line : eventText(event);
+    const status = typeof payload.status === "string" ? payload.status : eventText(event);
+    return typeof payload.lastError === "string" && payload.lastError ? `preview ${status}: ${payload.lastError}` : `preview ${status}`;
+  };
+
   const logsPanel = (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      {/* Runtime logs */}
+      <div className="flex shrink-0 items-center gap-2 border-b border-omp-border bg-white px-4 py-2.5 text-xs font-semibold uppercase tracking-[0.12em] text-omp-muted">
+        <Terminal size={14} /> Runtime logs
+        <span className="font-normal normal-case tracking-normal">container stdout/stderr — latest {Math.min(runtimeEvents.length, 100)} shown</span>
+      </div>
+      <div ref={runtimeLogRef} className="scrollbar-thin max-h-56 min-h-0 shrink-0 overflow-y-auto border-b border-omp-border bg-[#141827] p-3">
+        {runtimeEvents.length === 0 ? (
+          <p className="py-2 text-center font-mono text-xs text-white/50">No runtime logs yet — start the preview to see its output here.</p>
+        ) : (
+          <div className="space-y-0.5 font-mono text-xs leading-5 text-white/85">
+            {runtimeEvents.slice(-100).map((event, index) => (
+              <div key={`${event.eventId ?? index}-${event.type}`} className="flex gap-3">
+                <span className="shrink-0 text-white/40">{new Date(event.timestamp).toLocaleTimeString("en-US", { hour12: false })}</span>
+                <span className={`shrink-0 ${event.type === "preview_status" ? "text-[#e8a13a]" : "text-white/40"}`}>{event.type === "preview_status" ? "status" : "log"}</span>
+                <span className="min-w-0 break-words">{runtimeText(event)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {/* Session events */}
+      <div className="flex shrink-0 items-center gap-2 border-b border-omp-border bg-white px-4 py-2.5 text-xs font-semibold uppercase tracking-[0.12em] text-omp-muted">
+        <Terminal size={14} /> Session events
+      </div>
       <div className="scrollbar-thin min-h-0 flex-1 overflow-y-auto p-4">
-        {events.length === 0 ? (
+        {sessionEvents.length === 0 ? (
           <p className="py-10 text-center text-sm text-omp-muted">No session events yet — send a prompt to start the agent.</p>
         ) : (
           <div className="space-y-1.5 font-mono text-xs leading-5">
-            {events.map((event, index) => (
+            {sessionEvents.map((event, index) => (
               <div key={`${event.eventId ?? index}-${event.type}`} className="flex gap-3 rounded-md bg-white px-3 py-2">
                 <span className="shrink-0 text-omp-muted">{new Date(event.timestamp).toLocaleTimeString("en-US", { hour12: false })}</span>
                 <span className="shrink-0 rounded bg-omp-brandSubtle px-1.5 py-0.5 font-sans font-semibold text-omp-brand">{event.type}</span>

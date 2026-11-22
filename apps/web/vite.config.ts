@@ -8,7 +8,7 @@ export default defineConfig({
     port: 5173,
     allowedHosts: ["localhost", "127.0.0.1", "new-lovable.localhost"],
     proxy: {
-      "/api": { target: "http://127.0.0.1:8787", changeOrigin: false },
+      "/api": { target: "http://127.0.0.1:8787", changeOrigin: false, ws: true },
       "/ws": { target: "ws://127.0.0.1:8787", ws: true, changeOrigin: false },
     },
   },
