@@ -4,6 +4,7 @@ import type { Project, Provider, PublicUser } from "@omp-builder/shared";
 import { api } from "./api";
 import { Auth, type AuthState } from "./components/Auth";
 import { Builder } from "./components/Builder";
+import { workspacePreferencesKey } from "./workspace-preferences";
 import { Dashboard, ProjectsList } from "./components/Dashboard";
 import { NewProject } from "./components/NewProject";
 import { Providers } from "./components/Providers";
@@ -170,6 +171,7 @@ export default function App() {
     open(project);
   };
 
+  const preferencesKey = selected ? workspacePreferencesKey(auth.user.id, selected.id) : undefined;
   const content =
     screen === "dashboard" ? (
       <Dashboard projects={projects} providers={providers} onOpen={open} onCreate={() => setShowCreate(true)} onViewAll={() => setScreen("projects")} />
@@ -181,8 +183,8 @@ export default function App() {
       <GitHubView onBack={() => setScreen("dashboard")} />
     ) : screen === "settings" ? (
       <SettingsView user={auth.user} projects={projects} providers={providers} onLogout={logout} />
-    ) : selected ? (
-      <Builder project={selected} onNavigate={navigate} />
+    ) : selected && preferencesKey ? (
+      <Builder key={preferencesKey} preferencesKey={preferencesKey} project={selected} onNavigate={navigate} />
     ) : (
       <Dashboard projects={projects} providers={providers} onOpen={open} onCreate={() => setShowCreate(true)} onViewAll={() => setScreen("projects")} />
     );
