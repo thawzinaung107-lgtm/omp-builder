@@ -7,11 +7,10 @@ import { FileExplorer } from "./FileExplorer";
 import { MonacoEditor } from "./MonacoEditor";
 import { languageForPath } from "../editor-languages";
 import type { NavScreen } from "./Sidebar";
+import { loadWorkspacePreferences, mobileTabs, saveWorkspacePreferences, type WorkspacePreferences, type WorkspaceTab } from "../workspace-preferences";
 
 type ChatItem = { id: string; role: "user" | "assistant" | "tool" | "status"; text: string; eventType?: string };
 type Step = { id: string; label: string; done: boolean; failed: boolean };
-type Tab = "preview" | "code" | "files" | "logs" | "git";
-type MobileTab = "chat" | "preview" | "code" | "files";
 /** One open editor tab. `mtimeMs` is the last known on-disk mtime and is
  * sent back as expectedMtime on save, so concurrent edits conflict (409)
  * instead of silently overwriting. */
@@ -45,7 +44,7 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-const tabLabels: { id: Tab; label: string }[] = [
+const tabLabels: { id: WorkspaceTab; label: string }[] = [
   { id: "preview", label: "Preview" },
   { id: "code", label: "Code" },
   { id: "files", label: "Files" },
@@ -53,7 +52,7 @@ const tabLabels: { id: Tab; label: string }[] = [
   { id: "git", label: "Git" },
 ];
 
-export function Builder({ project, onNavigate }: { project: Project; onNavigate: (screen: NavScreen) => void }) {
+export function Builder({ project, preferencesKey, onNavigate }: { project: Project; preferencesKey: string; onNavigate: (screen: NavScreen) => void }) {
   const [chat, setChat] = useState("");
   const [items, setItems] = useState<ChatItem[]>([]);
   const [events, setEvents] = useState<SessionEvent[]>([]);
@@ -86,9 +85,16 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
   const [connection, setConnection] = useState<"connecting" | "connected" | "reconnecting" | "offline">("connecting");
   const [error, setError] = useState("");
   const [working, setWorking] = useState(false);
-  const [tab, setTab] = useState<Tab>("preview");
-  const [mobileTab, setMobileTab] = useState<MobileTab>("chat");
-  const [split, setSplit] = useState(false);
+  // App keys this instance by admin and project so state cannot cross scopes.
+  const [preferences, setPreferences] = useState(() => loadWorkspacePreferences(preferencesKey));
+  const { tab, mobileTab, split, device } = preferences;
+  const updatePreferences = useCallback((patch: Partial<WorkspacePreferences>) => {
+    setPreferences((current) => ({ ...current, ...patch }));
+  }, []);
+  const initialPreferences = useRef(preferences);
+  useEffect(() => {
+    if (preferences !== initialPreferences.current) saveWorkspacePreferences(preferencesKey, preferences);
+  }, [preferencesKey, preferences]);
   const [notice, setNotice] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [attachNote, setAttachNote] = useState(false);
@@ -102,7 +108,6 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
   useEffect(() => {
     previewRef.current = preview;
   }, [preview]);
-  const [device, setDevice] = useState<"desktop" | "mobile">("desktop");
   const [frameKey, setFrameKey] = useState(0);
   const socketRef = useRef<WebSocket | undefined>(undefined);
   const retryRef = useRef<number | undefined>(undefined);
@@ -149,8 +154,7 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
       setEditorError("");
       if (openFilesRef.current.some((f) => f.path === path)) {
         setActivePath(path);
-        setTab("code");
-        setMobileTab("code");
+        updatePreferences({ tab: "code", mobileTab: "code" });
         return;
       }
       try {
@@ -161,16 +165,14 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
             : [...current, { path: file.path, content: file.content, size: file.size, mtime: file.mtime, mtimeMs: file.mtimeMs, dirty: false }],
         );
         setActivePath(path);
-        setTab("code");
-        setMobileTab("code");
+        updatePreferences({ tab: "code", mobileTab: "code" });
       } catch (err) {
         // Binary files (415) and missing files land here.
         setEditorError(err instanceof Error ? err.message : "Could not open file");
-        setTab("code");
-        setMobileTab("code");
+        updatePreferences({ tab: "code", mobileTab: "code" });
       }
     },
-    [project.id],
+    [project.id, updatePreferences],
   );
 
   const saveFile = useCallback(
@@ -611,7 +613,7 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
         </span>
         <select
           value={device}
-          onChange={(event) => setDevice(event.target.value as "desktop" | "mobile")}
+          onChange={(event) => updatePreferences({ device: event.target.value as WorkspacePreferences["device"] })}
           className="shrink-0 rounded-omp border border-omp-border bg-white px-2 py-1.5 text-xs text-omp-ink outline-none"
           aria-label="Preview device"
         >
@@ -695,7 +697,7 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
           {preview?.status === "running" ? "Preview running via secure gateway" : "Preview not running"}
         </span>
         <span>{preview ? (preview.framework === "vite" ? "React + Vite" : "Static site") : "No preview yet"}</span>
-        <button type="button" onClick={() => setTab("code")} className="ml-auto font-medium text-omp-brand hover:underline">
+        <button type="button" onClick={() => updatePreferences({ tab: "code", mobileTab: "code" })} className="ml-auto font-medium text-omp-brand hover:underline">
           Open in editor ↗
         </button>
       </div>
@@ -816,8 +818,7 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
             variant="ghost"
             className="!px-3 !py-1.5 !text-xs"
             onClick={() => {
-              setTab("files");
-              setMobileTab("files");
+              updatePreferences({ tab: "files", mobileTab: "files" });
             }}
           >
             Browse files
@@ -905,8 +906,7 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
               variant="outline"
               className="mt-4"
               onClick={() => {
-                setTab("files");
-                setMobileTab("files");
+                updatePreferences({ tab: "files", mobileTab: "files" });
               }}
             >
               Browse files
@@ -1073,7 +1073,7 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
                 type="button"
                 role="tab"
                 aria-selected={tab === item.id}
-                onClick={() => setTab(item.id)}
+                onClick={() => updatePreferences({ tab: item.id })}
                 className={`rounded-omp px-3.5 py-2 text-sm transition ${tab === item.id ? "bg-omp-brandSubtle font-semibold text-omp-brand" : "text-omp-muted hover:bg-omp-canvas hover:text-omp-ink"}`}
               >
                 {item.label}
@@ -1083,9 +1083,10 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
           <div className="flex items-center gap-1">
             <button
               type="button"
-              onClick={() => setSplit((v) => !v)}
+              onClick={() => setPreferences((current) => ({ ...current, split: !current.split }))}
               className={`flex items-center gap-1.5 rounded-omp px-2.5 py-1.5 text-xs font-medium ${split ? "bg-omp-brandSubtle text-omp-brand" : "text-omp-muted hover:bg-omp-canvas"}`}
               title="Split preview and logs"
+              aria-pressed={split}
             >
               <SplitSquareHorizontal size={14} /> Split
             </button>
@@ -1149,13 +1150,13 @@ export function Builder({ project, onNavigate }: { project: Project; onNavigate:
             <ChevronDown size={14} className="shrink-0 text-omp-muted" />
           </label>
           <div className="mt-3 flex items-center gap-1" role="tablist" aria-label="Builder tabs">
-            {(["chat", "preview", "code", "files"] as MobileTab[]).map((item) => (
+            {mobileTabs.map((item) => (
               <button
                 key={item}
                 type="button"
                 role="tab"
                 aria-selected={mobileTab === item}
-                onClick={() => setMobileTab(item)}
+                onClick={() => updatePreferences({ mobileTab: item })}
                 className={`flex-1 rounded-omp px-2 py-2 text-[13px] capitalize transition ${mobileTab === item ? "bg-omp-brandSubtle font-semibold text-omp-brand" : "text-omp-muted"}`}
               >
                 {item}
