@@ -8,6 +8,8 @@ const compile = "12:07:30 PM [vite] Internal server error: Unexpected token\n  P
 test("recognizes Vite errors and only uses explicitly reported safe source positions", () => {
   assert.deepEqual(parsePreviewProblem(compile).location, { path: "src/main.ts", line: 4, column: 3 });
   assert.equal(parsePreviewProblem(compile).kind, "compile");
+  assert.deepEqual(parsePreviewProblem(compile.replace("main.ts", "Hello World.tsx")).location, { path: "src/Hello World.tsx", line: 4, column: 3 });
+  assert.equal(parsePreviewProblem(compile.replace("File: /app/src/main.ts", "Look at src/main.ts")).location, undefined);
   for (const unsafe of ["/etc/main.ts:4:3", "/app/../main.ts:4:3", "/app/.env.local:4:3",
     "/app/node_modules/package/main.js:4:3", "/app/main.ts:0:3", "/app/main.ts:4:0", "/app/main.ts:99999999:3"]) {
     assert.equal(parsePreviewProblem(compile.replace("/app/src/main.ts:4:3", unsafe)).location, undefined, unsafe);
@@ -73,6 +75,19 @@ test("waits for complete log records before exposing split secrets", () => {
     if (previous === undefined) delete process.env.A4_FIXTURE_TOKEN;
     else process.env.A4_FIXTURE_TOKEN = previous;
   }
+});
+
+test("drops orphaned base64 key records when capturing a bounded log tail", () => {
+  const body = "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD/e8I+SNbpcA==";
+  const records = [body, "abcd", "abc=", "-----END PRIVATE KEY-----", "Vite startup failed"];
+  assert.equal(sanitizePreviewOutput(records.join("\n")), "Vite startup failed");
+  const follower = new PreviewLogLines();
+  assert.deepEqual(follower.push(records.join("\n") + "\n"), ["Vite startup failed"]);
+  const store = new PreviewDiagnosticStore();
+  const run = store.begin("project");
+  store.capture("project", run, "line ".repeat(3000) + "\n" + records.join("\n"), "startup");
+  assert.doesNotMatch(JSON.stringify(store.get("project")), /MIIEvg|abcd|abc=/);
+  assert.match(store.get("project").problems[0].detail, /Vite startup failed/);
 });
 
 test("evicts inactive diagnostics without invalidating active runs", () => {

@@ -6,6 +6,13 @@ import { isProtectedPath, validateRelPath } from "./files.js";
 const MAX_OUTPUT = 12_000;
 const MAX_PROBLEMS = 8;
 
+// A bounded Podman tail can begin inside a private key, without a BEGIN
+// frame. Suppress whole base64 records even without the enclosing markers.
+function looksLikeKeyBody(line: string): boolean {
+  const text = line.trim();
+  return text.length >= 4 && text.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(text);
+}
+
 // Only release complete records to the log stream and diagnostic batches.
 export class PreviewLogLines {
   private partial = "";
@@ -38,11 +45,11 @@ export class PreviewLogLines {
     if (omitted) return undefined;
     const plain = stripVTControlCharacters(line);
     if (/-----BEGIN [^-]*PRIVATE KEY-----/i.test(plain)) this.inPrivateKey = true;
-    if (this.inPrivateKey) {
-      if (/-----END [^-]*PRIVATE KEY-----/i.test(plain)) this.inPrivateKey = false;
+    if (/-----END [^-]*PRIVATE KEY-----/i.test(plain)) {
+      this.inPrivateKey = false;
       return undefined;
     }
-    return line;
+    return this.inPrivateKey || looksLikeKeyBody(plain) ? undefined : line;
   }
 }
 
@@ -64,6 +71,9 @@ export function sanitizePreviewOutput(raw: string): string {
   }
   return text
     .replace(/-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\n]*PRIVATE KEY-----|$)/gi, "[redacted]")
+    .split("\n")
+    .filter((line) => !looksLikeKeyBody(line) && !/-----END [^-\n]*PRIVATE KEY-----/i.test(line))
+    .join("\n")
     .replace(/\b(?:bearer|basic)\s+[^\s,;]+/gi, "[redacted]")
     .replace(/\b[\w.-]*(?:secret|token|password|passwd|authorization|api[_-]?key|credential)[\w.-]*["']?\s*[:=]\s*(?:"[^"\n]*"|\x27[^\x27\n]*\x27|[^\s,;]+)/gi, "[redacted]")
     .replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s"'<>]+/gi, "[address]")
@@ -74,7 +84,14 @@ export function sanitizePreviewOutput(raw: string): string {
 }
 
 function sourceLocation(text: string): PreviewProblem["location"] {
-  for (const match of text.matchAll(/(?:^|\n)[ \t]*(?:File:\s*)?(?:\x1b\[[\d;]*m)*((?:\/app\/|\.\/)?[\w@.-]+(?:\/[\w@.-]+)*\.[\w]+):(\d+)(?::(\d+))?(?=[\s):]|$)/g)) {
+  for (const entry of text.split("\n")) {
+    const lineText = entry.trim();
+    const explicitPath = /^(?:File:\s*|\/app\/|\.\/)/i.test(lineText);
+    const source = lineText.replace(/^File:\s*/i, "");
+    const match = source.match(explicitPath
+      ? /^((?:\/app\/|\.\/)?[\w@. -]+(?:\/[\w@. -]+)*\.[\w]+):(\d+)(?::(\d+))?(?=[\s):]|$)/
+      : /^([\w@.-]+(?:\/[\w@.-]+)*\.[\w]+):(\d+)(?::(\d+))?(?=[\s):]|$)/);
+    if (!match) continue;
     try {
       const path = validateRelPath(match[1].replace(/^(?:\/app\/|\.\/)/, ""));
       const line = Number(match[2]);
