@@ -4,6 +4,8 @@ import { chmod, chown, copyFile, lstat, mkdir, readdir, readFile, rename, rm, st
 import { connect } from "node:net";
 import path from "node:path";
 import type Database from "better-sqlite3";
+import { PreviewDiagnosticStore, PreviewLogLines, previewOutputTail, sanitizePreviewOutput } from "./preview-diagnostics.js";
+import { isProtectedPath, readTextFile, resolveWorkspacePath } from "./files.js";
 
 /**
  * Phase 3C — Rootless Podman preview manager.
@@ -273,6 +275,7 @@ export class PreviewManager {
   private readonly projectsRoot: string;
   private readonly previewRoot: string;
   private readonly onEvent: (projectId: string, type: "preview_log" | "preview_status", payload: Record<string, unknown>) => void;
+  private readonly diagnostics = new PreviewDiagnosticStore();
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly syncTimers = new Map<string, NodeJS.Timeout>();
   private readonly logFollowers = new Map<string, ChildProcessWithoutNullStreams>();
@@ -310,6 +313,33 @@ export class PreviewManager {
     );
     return next;
   }
+
+  async problems(projectId: string) {
+    const snapshot = this.diagnostics.get(projectId);
+    const problems = await Promise.all(snapshot.problems.map(async (problem) => {
+      const location = problem.location;
+      if (!location) return problem;
+      try {
+        const root = await resolveWorkspacePath(this.projectsRoot, projectId, "");
+        const target = await resolveWorkspacePath(this.projectsRoot, projectId, location.path);
+        const relative = path.relative(root, target).split(path.sep).join("/");
+        // The staging copy excludes symlinks; don't link a substituted target.
+        if (relative !== location.path || isProtectedPath(relative)) return { ...problem, location: undefined };
+        const { content } = await readTextFile(this.projectsRoot, projectId, location.path);
+        const source = content.split(/\r?\n/)[location.line - 1];
+        if (source !== undefined && (location.column === undefined || location.column <= source.length + 1)) return problem;
+      } catch { /* Location no longer opens through the file API. */ }
+      return { ...problem, location: undefined };
+    }));
+    const latest = this.diagnostics.get(projectId);
+    // Never return a prior snapshot if a restart, write, or new output raced
+    // file validation. The next read will try linking the current locations.
+    return latest === snapshot ? { ...snapshot, problems } : {
+      ...latest, problems: latest.problems.map((problem) => ({ ...problem, location: undefined })),
+    };
+  }
+
+  forgetProblems(projectId: string) { this.diagnostics.forget(projectId); }
 
   row(projectId: string): PreviewState | null {
     const row = this.getStateStmt.get(projectId) as
@@ -486,7 +516,7 @@ export class PreviewManager {
       return [
         "sh",
         "-c",
-        "cd /app && (if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi) && exec npx vite --config /app/vite.preview.config.mjs --host 0.0.0.0 --port $PORT",
+        "cd /app && (if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi) || { printf '%s\\n' '[omp-preview] dependency installation failed'; exit 1; }; exec npx vite --config /app/vite.preview.config.mjs --host 0.0.0.0 --port $PORT",
       ];
     }
     return ["node", "/app/preview-server.mjs"];
@@ -508,29 +538,23 @@ export class PreviewManager {
   private async waitReady(state: PreviewState, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     const url = `http://127.0.0.1:${state.hostPort}/`;
-    let lastError = "";
     while (Date.now() < deadline) {
       const live = await this.inspectContainer(state.containerName);
       if (!live) throw new Error("Preview container disappeared while starting");
-      if (live.status !== "running") {
-        const logs = await this.logs(state.projectId, 50).catch(() => ({ running: false, logs: "" }));
-        throw new Error(`Preview container exited (code ${live.exitCode}${live.oomKilled ? ", OOM-killed" : ""}). Logs:\n${logs.logs}`.slice(0, 2000));
-      }
+      if (live.status !== "running") throw new Error("Preview exited before reaching readiness");
       try {
         const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
         // Any HTTP response (even 404 from the static server) proves the
         // server is up; Vite also answers 200 once ready.
         await response.arrayBuffer().catch(() => undefined);
         return;
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error);
-      }
+      } catch { /* Retry readiness until the deadline. */ }
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    throw new Error(`Preview did not become ready within ${Math.round(timeoutMs / 1000)}s (last error: ${lastError})`);
+    throw new Error(`Preview did not become ready within ${Math.round(timeoutMs / 1000)}s`);
   }
 
-  private attachLogFollower(projectId: string, containerName: string): void {
+  private attachLogFollower(projectId: string, containerName: string, runId: string): void {
     this.detachLogFollower(projectId);
     // Phase 3.5 fix pass (§2 fast path, same as runPodman): when the API
     // already runs as omp-builder, spawn podman directly — runuser refuses
@@ -557,30 +581,43 @@ export class PreviewManager {
           cwd: "/",
         });
     this.logFollowers.set(projectId, child);
-    let buffer = "";
-    const flushLines = () => {
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.trim() === "") continue;
-        this.onEvent(projectId, "preview_log", { line: line.slice(0, MAX_LOG_LINE_CHARS) });
+    let pending = "";
+    let timer: NodeJS.Timeout | undefined;
+    const capture = () => {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      if (this.logFollowers.get(projectId) === child && pending.trim()) {
+        this.diagnostics.capture(projectId, runId, pending);
       }
+      pending = "";
     };
-    child.stdout.on("data", (chunk) => {
-      buffer += String(chunk);
-      if (buffer.length > 65536) buffer = buffer.slice(-65536);
-      flushLines();
+    const streams = [child.stdout, child.stderr].map((stream) => {
+      const records = new PreviewLogLines();
+      stream.setEncoding("utf8");
+      stream.on("data", (chunk: string) => {
+        if (this.logFollowers.get(projectId) !== child) return;
+        append(records.push(chunk));
+      });
+      return records;
     });
-    child.stderr.on("data", (chunk) => {
-      buffer += String(chunk);
-      if (buffer.length > 65536) buffer = buffer.slice(-65536);
-      flushLines();
+    const append = (lines: string[]) => {
+      if (!lines.length) return;
+      for (const line of lines) {
+        const safe = sanitizePreviewOutput(line).slice(0, MAX_LOG_LINE_CHARS);
+        if (safe) this.onEvent(projectId, "preview_log", { line: safe });
+      }
+      pending = previewOutputTail([pending, ...lines].join("\n"));
+      timer ??= setTimeout(capture, 150);
+    };
+    child.on("error", () => {
+      // A follower failure is infrastructure output, not a project diagnostic.
     });
     child.once("close", () => {
-      if (buffer.trim() !== "") {
-        this.onEvent(projectId, "preview_log", { line: buffer.trim().slice(0, MAX_LOG_LINE_CHARS) });
-      }
-      if (this.logFollowers.get(projectId) === child) this.logFollowers.delete(projectId);
+      if (this.logFollowers.get(projectId) !== child) { capture(); return; }
+      append(streams.map((records) => records.finish()).filter((line): line is string => line !== undefined));
+      capture();
+      this.logFollowers.delete(projectId);
+      void this.getStatus(projectId).catch(() => undefined);
     });
   }
 
@@ -598,90 +635,102 @@ export class PreviewManager {
         const live = await this.inspectContainer(existing.containerName);
         if (live && live.status === "running") return existing;
       }
-      const { framework, containerPort } = await this.syncStaging(projectId, workspacePath);
-      let hostPort = existing?.hostPort;
-      if (!hostPort || hostPort < PREVIEW_PORT_MIN || hostPort > PREVIEW_PORT_MAX) {
-        hostPort = await this.allocatePort(projectId);
-      } else if (existing && existing.status !== "running") {
-        // Reuse the recorded port if it is actually free.
-        if (!(await isPortFree(hostPort))) hostPort = await this.allocatePort(projectId);
-      }
-      const containerName = previewContainerName(projectId);
-      const now = new Date().toISOString();
-      const starting: PreviewState = {
-        projectId,
-        containerName,
-        hostPort,
-        containerPort,
-        framework,
-        status: "starting",
-        lastError: null,
-        updatedAt: now,
-      };
-      this.saveState(starting);
-      this.onEvent(projectId, "preview_status", { status: "starting", hostPort, framework });
-      // Remove any same-name container left from a previous run (crashed,
-      // or created before the DB row existed). Never touches project files.
-      await runPodman(["rm", "-f", containerName]).catch(() => undefined);
-      const args = [
-        "run",
-        "-d",
-        "--name",
-        containerName,
-        // The default log driver here is journald, whose entries a
-        // service-user podman cannot read back (podman logs comes back
-        // empty). k8s-file keeps container stdout in a file podman logs
-        // can actually read, which the logs endpoint and follower need.
-        "--log-driver",
-        "k8s-file",
-        "-p",
-        `127.0.0.1:${hostPort}:${containerPort}`,
-        "--cap-drop=ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--read-only",
-        "--tmpfs",
-        "/tmp",
-        "-v",
-        `${previewVolumeName(projectId)}:/app/node_modules`,
-        "-v",
-        `${previewStagingDir(projectId, this.previewRoot)}:/app:ro`,
-        "--memory",
-        PREVIEW_MEMORY,
-        "--memory-swap",
-        PREVIEW_MEMORY,
-        "--cpus",
-        PREVIEW_CPUS,
-        "--pids-limit",
-        PREVIEW_PIDS_LIMIT,
-        "-e",
-        framework === "vite" ? "NODE_ENV=development" : "NODE_ENV=production",
-        "-e",
-        `PORT=${containerPort}`,
-        "-e",
-        "HOME=/tmp",
-        PREVIEW_IMAGE,
-        ...this.containerCommand(framework),
-      ];
-      const result = await runPodman(args, 60_000);
-      if (result.code !== 0) {
-        const message = `podman run failed: ${cleanPodmanError(result.stderr) || result.stdout || `exit ${result.code}`}`.slice(0, 1000);
-        this.setStatus(projectId, "error", message);
-        throw new PreviewError(500, message);
-      }
-      const state: PreviewState = { ...starting, status: "running", updatedAt: new Date().toISOString() };
+      this.detachLogFollower(projectId);
+      const runId = this.diagnostics.begin(projectId);
       try {
-        await this.waitReady(state, framework === "vite" ? 240_000 : 30_000);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Preview failed to start";
+        const { framework, containerPort } = await this.syncStaging(projectId, workspacePath);
+        let hostPort = existing?.hostPort;
+        if (!hostPort || hostPort < PREVIEW_PORT_MIN || hostPort > PREVIEW_PORT_MAX) {
+          hostPort = await this.allocatePort(projectId);
+        } else if (existing && existing.status !== "running") {
+          // Reuse the recorded port if it is actually free.
+          if (!(await isPortFree(hostPort))) hostPort = await this.allocatePort(projectId);
+        }
+        const containerName = previewContainerName(projectId);
+        const now = new Date().toISOString();
+        const starting: PreviewState = {
+          projectId,
+          containerName,
+          hostPort,
+          containerPort,
+          framework,
+          status: "starting",
+          lastError: null,
+          updatedAt: now,
+        };
+        this.saveState(starting);
+        this.onEvent(projectId, "preview_status", { status: "starting", hostPort, framework });
+        // Remove any same-name container left from a previous run (crashed,
+        // or created before the DB row existed). Never touches project files.
         await runPodman(["rm", "-f", containerName]).catch(() => undefined);
-        this.setStatus(projectId, "error", message.slice(0, 1000));
-        throw new PreviewError(500, message.slice(0, 1000));
+        const args = [
+          "run",
+          "-d",
+          "--name",
+          containerName,
+          // The default log driver here is journald, whose entries a
+          // service-user podman cannot read back (podman logs comes back
+          // empty). k8s-file keeps container stdout in a file podman logs
+          // can actually read, which the logs endpoint and follower need.
+          "--log-driver",
+          "k8s-file",
+          "-p",
+          `127.0.0.1:${hostPort}:${containerPort}`,
+          "--cap-drop=ALL",
+          "--security-opt",
+          "no-new-privileges",
+          "--read-only",
+          "--tmpfs",
+          "/tmp",
+          "-v",
+          `${previewVolumeName(projectId)}:/app/node_modules`,
+          "-v",
+          `${previewStagingDir(projectId, this.previewRoot)}:/app:ro`,
+          "--memory",
+          PREVIEW_MEMORY,
+          "--memory-swap",
+          PREVIEW_MEMORY,
+          "--cpus",
+          PREVIEW_CPUS,
+          "--pids-limit",
+          PREVIEW_PIDS_LIMIT,
+          "-e",
+          framework === "vite" ? "NODE_ENV=development" : "NODE_ENV=production",
+          "-e",
+          `PORT=${containerPort}`,
+          "-e",
+          "HOME=/tmp",
+          PREVIEW_IMAGE,
+          ...this.containerCommand(framework),
+        ];
+        const result = await runPodman(args, 60_000);
+        if (result.code !== 0) throw new Error("Preview container could not launch");
+        const state: PreviewState = { ...starting, status: "running", updatedAt: new Date().toISOString() };
+        try {
+          await this.waitReady(state, framework === "vite" ? 240_000 : 30_000);
+        } catch {
+          // Read the failed container before removal. Do not use Podman's
+          // own failed-command stderr as project output.
+          const logs = await runPodman(["logs", "--tail", "50", containerName], 5000).catch(() => null);
+          const output = logs?.code === 0 ? `${previewOutputTail(logs.stdout, 6000)}\n${cleanPodmanError(previewOutputTail(logs.stderr, 6000))}` : "";
+          this.diagnostics.capture(projectId, runId, output || "The project exited or did not become ready.", "startup");
+          await runPodman(["rm", "-f", containerName]).catch(() => undefined);
+          throw new Error("Project startup failed");
+        }
+        this.saveState(state);
+        this.diagnostics.phase(projectId, runId, "running");
+        this.onEvent(projectId, "preview_status", { status: "running", hostPort, framework });
+        this.attachLogFollower(projectId, containerName, runId);
+        return state;
+      } catch (error) {
+        if (!this.diagnostics.get(projectId).problems.length) {
+          this.diagnostics.capture(projectId, runId, "The preview could not be prepared or launched. Check the preview service and try again.", "runtime");
+        }
+        this.diagnostics.phase(projectId, runId, "failed");
+        const message = "Preview could not start. See Problems for details.";
+        this.setStatus(projectId, "error", message);
+        throw new PreviewError(error instanceof PreviewError ? error.status : 500, message);
       }
-      this.saveState(state);
-      this.onEvent(projectId, "preview_status", { status: "running", hostPort, framework });
-      this.attachLogFollower(projectId, containerName);
-      return state;
     });
   }
 
@@ -689,6 +738,8 @@ export class PreviewManager {
     return this.runExclusive(projectId, async () => {
       const existing = this.row(projectId);
       this.detachLogFollower(projectId);
+      const { runId } = this.diagnostics.get(projectId);
+      if (runId) this.diagnostics.phase(projectId, runId, "stopped");
       if (existing) {
         await runPodman(["rm", "-f", existing.containerName]).catch(() => undefined);
         const stopped = this.setStatus(projectId, "stopped", null);
@@ -708,15 +759,25 @@ export class PreviewManager {
     const current = this.row(projectId);
     if (!current) return null;
     if (current.status !== "running" && current.status !== "starting") return current;
+    // Do not mark a container ready while start() is still checking HTTP.
+    if (current.status === "starting") return current;
     const live = await this.inspectContainer(current.containerName);
+    if (this.row(projectId)?.updatedAt !== current.updatedAt) return this.row(projectId);
     if (!live) {
+      this.detachLogFollower(projectId);
+      const { runId } = this.diagnostics.get(projectId);
+      if (runId) this.diagnostics.phase(projectId, runId, "stopped");
       return this.setStatus(projectId, "stopped", "Preview container no longer exists");
     }
     if (live.status === "running") {
-      if (current.status !== "running") return this.setStatus(projectId, "running", null);
       return current;
     }
     const message = `Preview container exited with code ${live.exitCode}${live.oomKilled ? " (OOM-killed)" : ""}`;
+    const { runId, problems } = this.diagnostics.get(projectId);
+    if (runId) {
+      if (!problems.some((problem) => !problem.stale)) this.diagnostics.capture(projectId, runId, message, "runtime");
+      this.diagnostics.phase(projectId, runId, "failed");
+    }
     return this.setStatus(projectId, "crashed", message);
   }
 
@@ -734,7 +795,7 @@ export class PreviewManager {
       .split("\n")
       .filter((line) => !line.includes("level=warning") && !line.includes("cgroup") && line.trim() !== "")
       .join("\n");
-    return { running: live?.status === "running", logs: result.stdout + (cleanStderr ? `${cleanStderr}\n` : "") };
+    return { running: live?.status === "running", logs: sanitizePreviewOutput(`${previewOutputTail(result.stdout, 6000)}\n${previewOutputTail(cleanStderr, 6000)}`) };
   }
 
   /** Debounced re-sync after file saves / OMP files_modified. No restart: the
@@ -743,12 +804,15 @@ export class PreviewManager {
   notifyFilesChanged(projectId: string, workspacePath: string): void {
     const current = this.row(projectId);
     if (!current || (current.status !== "running" && current.status !== "starting")) return;
+    const { runId } = this.diagnostics.get(projectId);
     const pending = this.syncTimers.get(projectId);
     if (pending) clearTimeout(pending);
     this.syncTimers.set(
       projectId,
       setTimeout(() => {
         this.syncTimers.delete(projectId);
+        if (this.diagnostics.get(projectId).runId !== runId || this.row(projectId)?.status === "stopped") return;
+        this.diagnostics.changed(projectId);
         void this.syncStaging(projectId, workspacePath).catch((error) => {
           console.error(`[preview] staging re-sync failed for ${projectId}:`, error instanceof Error ? error.message : error);
         });
@@ -799,7 +863,9 @@ export class PreviewManager {
         markedStale.push(row.project_id);
       } else if (live.status === "running") {
         this.setStatus(row.project_id, "running", null, false);
-        this.attachLogFollower(row.project_id, row.container_name);
+        const runId = this.diagnostics.begin(row.project_id);
+        this.diagnostics.phase(row.project_id, runId, "running");
+        this.attachLogFollower(row.project_id, row.container_name, runId);
       } else {
         this.setStatus(row.project_id, "crashed", `Preview container exited with code ${live.exitCode}${live.oomKilled ? " (OOM-killed)" : ""} (found on API restart)`);
         markedStale.push(row.project_id);

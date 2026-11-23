@@ -4,6 +4,9 @@ import type { BrowserCommand, Project, Provider, SessionEvent } from "@omp-build
 import { api, ApiError, type PreviewState } from "../api";
 import { Button, StatusChip, timeAgo } from "../ui";
 import { FileExplorer } from "./FileExplorer";
+import { diagnosticDraft } from "../diagnostic-draft";
+import { Problems } from "./Problems";
+import type { PreviewProblem } from "@omp-builder/shared";
 import { MonacoEditor } from "./MonacoEditor";
 import { languageForPath } from "../editor-languages";
 import type { NavScreen } from "./Sidebar";
@@ -48,12 +51,16 @@ const tabLabels: { id: WorkspaceTab; label: string }[] = [
   { id: "preview", label: "Preview" },
   { id: "code", label: "Code" },
   { id: "files", label: "Files" },
+  { id: "problems", label: "Problems" },
   { id: "logs", label: "Logs" },
   { id: "git", label: "Git" },
 ];
 
 export function Builder({ project, preferencesKey, onNavigate }: { project: Project; preferencesKey: string; onNavigate: (screen: NavScreen) => void }) {
   const [chat, setChat] = useState("");
+  const [fixDraft, setFixDraft] = useState<string | null>(null);
+  const draft = fixDraft ?? chat;
+  const [editorTarget, setEditorTarget] = useState<PreviewProblem["location"]>();
   const [items, setItems] = useState<ChatItem[]>([]);
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [steps, setSteps] = useState<Step[]>([]);
@@ -150,7 +157,8 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
 
   // Phase 3B — editor actions.
   const openFile = useCallback(
-    async (path: string) => {
+    async (path: string, location?: PreviewProblem["location"]) => {
+      setEditorTarget(location);
       setEditorError("");
       if (openFilesRef.current.some((f) => f.path === path)) {
         setActivePath(path);
@@ -434,10 +442,11 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
   };
   const sendPrompt = (event: FormEvent) => {
     event.preventDefault();
-    const message = chat.trim();
+    const message = draft.trim();
     if (!message || !sendCommand({ type: "prompt", message })) return;
     setItems((current) => [...current, { id: `user-${Date.now()}`, role: "user", text: message }]);
-    setChat("");
+    if (fixDraft !== null) setFixDraft(null);
+    else setChat("");
     setWorking(true);
     setSettled(false);
     setError("");
@@ -535,16 +544,21 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
 
   const composer = (
     <form onSubmit={sendPrompt} className="shrink-0 border-t border-omp-border bg-white p-3">
+      {fixDraft !== null && <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+        <span>Review fix draft{chat ? " · Previous draft kept" : ""}</span>
+        <button type="button" onClick={() => setFixDraft(null)} className="font-medium text-omp-brand">Cancel fix draft</button>
+      </div>}
       <div className="rounded-omp border border-omp-border bg-white focus-within:border-omp-brand focus-within:ring-2 focus-within:ring-omp-brand/15">
         <textarea
-          value={chat}
-          onChange={(event) => setChat(event.target.value)}
+          value={draft}
+          onChange={(event) => (fixDraft === null ? setChat : setFixDraft)(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
+            if (fixDraft === null && event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
             }
           }}
+          data-omp-composer
           placeholder="Ask OMP to change anything..."
           rows={3}
           className="w-full resize-none bg-transparent px-3.5 py-3 text-sm text-omp-ink outline-none placeholder:text-omp-muted/70"
@@ -562,7 +576,7 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
                 <X size={13} /> Stop
               </Button>
             )}
-            <Button type="submit" disabled={!chat.trim() || connection !== "connected"} className="!px-4 !py-2">
+            <Button type="submit" disabled={!draft.trim() || connection !== "connected"} className="!px-4 !py-2">
               Send <ArrowUp size={14} />
             </Button>
           </div>
@@ -654,7 +668,7 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
       </div>
       {previewError && (
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[#f6c6c6] bg-[#fdecec] px-4 py-2 text-xs text-[#a83232]">
-          <span>{previewError}</span>
+          <span>{previewError} <button type="button" className="underline" onClick={() => updatePreferences({ tab: "problems", mobileTab: "problems" })}>View Problems</button></span>
           <button type="button" onClick={() => setPreviewError("")} aria-label="Dismiss" className="text-[#a83232] hover:text-omp-ink">
             <X size={14} />
           </button>
@@ -890,6 +904,7 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
           key={activeFile.path}
           value={activeFile.content}
           language={languageForPath(activeFile.path)}
+          target={editorTarget?.path === activeFile.path ? editorTarget : undefined}
           onChange={(next) =>
             setOpenFiles((current) => current.map((f) => (f.path === activeFile.path ? { ...f, content: next, dirty: true } : f)))
           }
@@ -944,8 +959,23 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
     </div>
   );
 
+  const problemsPanel = <Problems
+    projectId={project.id}
+    onOpen={(location) => void openFile(location.path, location)}
+    onFix={(problem) => {
+      setFixDraft((current) => current ?? diagnosticDraft(problem));
+      updatePreferences({ mobileTab: "chat" });
+      // Focus the visible composer after switching the mobile view.
+      requestAnimationFrame(() => {
+        [...document.querySelectorAll<HTMLTextAreaElement>("textarea[data-omp-composer]")]
+          .find((input) => input.getClientRects().length > 0)?.focus();
+      });
+    }}
+  />;
+
   const tabContent = useMemo(() => {
     if (tab === "preview") return previewPanel;
+    if (tab === "problems") return problemsPanel;
     if (tab === "logs") return logsPanel;
     if (tab === "code") return codePanel;
     if (tab === "files")
@@ -964,7 +994,7 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
       "Source control arrives in Phase 4",
       "GitHub clone, commit, push and branch history will live here, with confirmation for destructive actions.",
     );
-  }, [tab, previewPanel, logsPanel, codePanel, project.id, changedPaths, filesRefreshToken, openFile]);
+  }, [tab, previewPanel, logsPanel, codePanel, problemsPanel, project.id, changedPaths, filesRefreshToken, openFile]);
 
   const railItems: { id: NavScreen; label: string; icon: typeof LayoutDashboard; active?: boolean }[] = [
     { id: "dashboard", label: "Overview", icon: LayoutDashboard },
@@ -1065,7 +1095,7 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
             </Button>
           </div>
         </header>
-        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-omp-border bg-white px-5 py-2.5">
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-omp-border bg-white px-5 py-2.5">
           <div className="flex items-center gap-1" role="tablist" aria-label="Workspace tabs">
             {tabLabels.map((item) => (
               <button
@@ -1149,7 +1179,7 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
             </select>
             <ChevronDown size={14} className="shrink-0 text-omp-muted" />
           </label>
-          <div className="mt-3 flex items-center gap-1" role="tablist" aria-label="Builder tabs">
+          <div className="mt-3 flex flex-wrap items-center gap-1" role="tablist" aria-label="Builder tabs">
             {mobileTabs.map((item) => (
               <button
                 key={item}
@@ -1174,7 +1204,7 @@ export function Builder({ project, preferencesKey, onNavigate }: { project: Proj
           </div>
         ) : mobileTab === "preview" ? (
           <div className="flex min-h-0 flex-1 flex-col">{previewPanel}</div>
-        ) : mobileTab === "code" ? (
+        ) : mobileTab === "problems" ? problemsPanel : mobileTab === "code" ? (
           <div className="flex min-h-0 flex-1 flex-col">{codePanel}</div>
         ) : (
           <div className="flex min-h-0 flex-1 flex-col bg-white">

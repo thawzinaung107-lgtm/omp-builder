@@ -33,11 +33,13 @@ export function MonacoEditor({
   language,
   onChange,
   readOnly = false,
+  target,
 }: {
   value: string;
   language: string;
   onChange: (value: string) => void;
   readOnly?: boolean;
+  target?: { line: number; column?: number };
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -97,6 +99,16 @@ export function MonacoEditor({
   useEffect(() => {
     editorRef.current?.updateOptions({ readOnly });
   }, [readOnly]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!target || !editor || !model) return;
+    const position = model.validatePosition({ lineNumber: target.line, column: target.column ?? 1 });
+    editor.setPosition(position);
+    editor.revealPositionInCenter(position);
+    editor.focus();
+  }, [target]);
 
   return <div ref={containerRef} className="min-h-0 flex-1" aria-label="Code editor" />;
 }

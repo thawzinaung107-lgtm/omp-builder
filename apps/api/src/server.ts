@@ -224,7 +224,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       json(res, 404, { error: "Not found" }); return;
     }
     // Phase 3C — rootless Podman preview manager (admin session required).
-    const previewMatch = url.pathname.match(/^\/api\/projects\/([0-9a-f-]+)\/preview(?:\/(start|stop|restart|status|logs))?$/);
+    const previewMatch = url.pathname.match(/^\/api\/projects\/([0-9a-f-]+)\/preview(?:\/(start|stop|restart|status|logs|problems))?$/);
     if (previewMatch) {
       const projectId = previewMatch[1];
       const action = previewMatch[2] ?? "";
@@ -234,6 +234,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (method === "POST" && action === "stop") { json(res, 200, { preview: await previewManager.stop(projectId) }); return; }
       if (method === "POST" && action === "restart") { json(res, 200, { preview: await previewManager.restart(projectId, workspacePath) }); return; }
       if (method === "GET" && action === "status") { json(res, 200, { preview: await previewManager.getStatus(projectId) }); return; }
+      if (method === "GET" && action === "problems") { json(res, 200, await previewManager.problems(projectId)); return; }
       if (method === "GET" && action === "logs") {
         const tail = Number(url.searchParams.get("tail") ?? 200);
         json(res, 200, await previewManager.logs(projectId, Number.isFinite(tail) ? tail : 200));
@@ -308,6 +309,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (peers) { for (const ws of peers) { try { ws.close(1000, "Project deleted"); } catch { /* already closed */ } } sockets.delete(id); }
       workspaceWatcher.unwatch(id);
       await previewManager.stop(id).catch(() => undefined);
+      previewManager.forgetProblems(id);
       await manager.closeProject(id);
       const swept = await terminateWorkspaceProcesses(workspacePath);
       db.prepare("DELETE FROM omp_events WHERE project_id = ?").run(id);
