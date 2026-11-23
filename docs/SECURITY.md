@@ -59,23 +59,35 @@
   re-probes) plus `npm run test:rpc`, `npm run test:security`,
   `npm run typecheck`, `npm run build`, `npm audit --omit=dev`.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:e2185eb0a57f652dd9c8e8b40dd717d14f0e8f51bda972a66756ef0859bbdea2 -->
+
 ## Current Phase 2 controls
 
 - Single-admin setup is one-time and password hashes use Node's `scrypt` with a random salt.
 - Login is rate-limited in memory per IP; production should place the API behind Caddy and add durable abuse monitoring.
 - Session tokens are random opaque values; only a SHA-256 token hash is stored. Cookies are HTTP-only and SameSite=Lax.
-- Private API routes require a non-expired session. WebSocket upgrades require the same cookie and project ownership.
+- Private API routes require a non-expired session. WebSocket upgrades require the same session and an existing project; the single administrator has access to all projects. There is no per-project owner ACL.
 - Project names and IDs are validated; server-generated paths are not accepted from the browser.
-- No terminal, arbitrary process execution, raw filesystem, provider secret, or OMP process endpoint is exposed.
-- Provider credentials use AES-256-GCM with a server-only master key and are never returned to the browser or written to generated `models.yml` as plaintext.
+- The browser has no general shell or raw filesystem endpoint. OMP child permissions and credentials are a separate boundary; see the [post-merge audit](POST_MERGE_AUDIT.md).
+- Provider credentials use AES-256-GCM with a server-only master key at rest and are not returned to the browser or written to generated `models.yml` as plaintext.
 - Provider URLs reject unsafe protocols, non-local HTTP, private-network DNS targets, credentials, query strings, and redirects.
 - OMP runs headless and approval/UI requests fail closed until an explicit approval bridge exists.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ## Required before production
 - Replace the in-memory rate limiter with a durable bounded store and proxy-aware trusted-IP configuration.
 - Add CSRF protection for state-changing cookie-authenticated requests (origin check plus CSRF token where cross-origin deployment is possible).
 - Add security headers, strict origin allowlists, WebSocket message schemas, payload/connection limits, audit logging, session revocation, and backup key rotation.
-- Run generated previews in rootless, per-project containers with no Docker socket, no host network, read-only base image, writable project volume only, CPU/memory/PID/disk limits, and egress restrictions. (Phase 3C implements all of this except egress restrictions — see the Phase 3C section above.)
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:d454d4b129278814a7bd61c35e3cf5035f1d4f986b1cedd9f33e839d54f4d992 -->
+
+- Verify rootless execution, read-only staging, limited writable storage, effective CPU/memory/PID limits, disk quotas and outbound policy on the target host. Launch flags are present; disk quotas and restricted egress are not established by those flags. Keep the dedicated preview origin gate open.
+
+<!-- /coderabbit-ai-generated:v1 -->
 - Validate every Git path and remote; require confirmation for reset, revert, force push, branch deletion, and other destructive operations.
 
 ## Threat model

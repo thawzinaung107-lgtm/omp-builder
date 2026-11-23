@@ -6,7 +6,15 @@ Open **Problems** in desktop or mobile Build Studio. Start or restart the previe
 
 **Fix with OMP** opens an editable draft and labels the diagnostic as untrusted build output. If a chat draft already exists, it stays available after canceling or sending the fix draft. Review and explicitly press **Send** to use the existing authenticated OMP RPC workflow.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:9cd7319c4e4039e08c0d62f2e8f59628366bc6fb9e5eb0a36e39240c6f249d8f -->
+
 Each preview run has a separate diagnostic snapshot. Restarting replaces it; stopped previews and diagnostics after a staged source update are labeled as potentially stale until the next observation. A running preview with no current reported errors is not a full build certification. Snapshots are bounded and held in API memory, so diagnostic history does not survive an API restart. Unsupported log formats can appear as plain details on startup failure without an editor link. Log redaction removes known credential and path patterns; projects should never print secrets.
+
+**Acceptance remains open.** The post-merge audit found incomplete redaction of free text and structured locations. A single batch can collapse distinct errors; splitting a header from its location can remove its link. Real npm and Vite output were classified locally; container capture, exact caret position and provider-backed recovery remain unverified. See [evidence and fixes](POST_MERGE_AUDIT.md).
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 ## Local verification
 
