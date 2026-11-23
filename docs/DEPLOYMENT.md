@@ -231,7 +231,15 @@ environment win). `.env` is mode **0600**; never print its values.
   additive (`user_version` 3 as of Phase 3); there is no downgrade path
   — keep the previous release directory and the pre-migration DB backup.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:de8aa33bc88e8e76deedc35b9261dcb73a2917befcd2ef7a1b43d822ebd2de2c -->
+
 ## Production checklist (still open)
+
+Release decision at 179a450: **hold**. In addition to the operational gates below, resolve the [audit findings](POST_MERGE_AUDIT.md) on diagnostic disclosure, OMP child credentials and socket revocation. Rehearse on an authorized disposable deployment with effective cgroup measurements, separated preview origin, restricted egress and a real provider. The test counts below are historical; they are not results for a new deployment.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 - Split the single `omp-builder.service` unit into separate API + web
   units (with `Restart=on-failure`, `NoNewPrivileges=yes`,
