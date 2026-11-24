@@ -38,3 +38,15 @@ button:disabled { cursor: not-allowed; }
 .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
 .scrollbar-thin::-webkit-scrollbar-thumb { background: #d3d8e6; border-radius: 999px; }
 .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+
+/* Milestone B (A6) — container-query toolbar labels. A toolbar marked
+   .workspace-toolbar is a container; when it narrows below 560px its
+   text labels hide and only the icons remain. */
+.workspace-toolbar {
+  container-type: inline-size;
+}
+@container (max-width: 560px) {
+  .workspace-toolbar .toolbar-label {
+    display: none;
+  }
+}

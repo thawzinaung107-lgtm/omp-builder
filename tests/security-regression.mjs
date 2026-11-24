@@ -52,7 +52,12 @@ try {
   seededChild.kill("SIGKILL");
   const productionEnv = { ...env, APP_ENV: "production", API_PORT: String(port + 1) };
   const production = spawn(process.execPath, [path.join(root, "apps/api/dist/server.js")], { cwd: "/tmp", env: productionEnv, stdio: ["ignore", "pipe", "pipe"] });
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  // Fixed 250ms sleep raced real startup (~500ms measured 2026-11-23):
+  // poll /api/health like the other children instead of guessing.
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    try { if ((await fetch(`http://127.0.0.1:${port + 1}/api/health`)).ok) break; } catch { /* process is starting */ }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
   const productionStatus = await fetch(`http://127.0.0.1:${port + 1}/api/auth/status`, { headers: { Origin: allowedOrigin } });
   assert.equal(productionStatus.status, 403);
   production.kill("SIGKILL");

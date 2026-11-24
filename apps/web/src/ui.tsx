@@ -49,9 +49,13 @@ type ButtonProps = {
   disabled?: boolean;
   className?: string;
   title?: string;
+  // Milestone E (B3) — forwarded to the <button> so callers can label
+  // icon/text buttons for tests and assistive tech. Without this the
+  // prop is silently dropped (tsc does not flag unknown props here).
+  "aria-label"?: string;
 };
 
-export function Button({ children, variant = "primary", onClick, type = "button", disabled = false, className = "", title }: ButtonProps) {
+export function Button({ children, variant = "primary", onClick, type = "button", disabled = false, className = "", title, "aria-label": ariaLabel }: ButtonProps) {
   const classes = {
     primary: "bg-omp-brand text-white shadow-sm hover:bg-omp-brandHover",
     subtle: "bg-omp-brandSubtle text-omp-brand hover:bg-[#e2dbff]",
@@ -65,6 +69,7 @@ export function Button({ children, variant = "primary", onClick, type = "button"
       disabled={disabled}
       onClick={onClick}
       title={title}
+      aria-label={ariaLabel}
       className={`inline-flex items-center justify-center gap-2 rounded-omp px-4 py-2.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${classes[variant]} ${className}`}
     >
       {children}

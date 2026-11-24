@@ -4,7 +4,10 @@
   "private": true,
   "description": "Self-hosted web application builder powered exclusively by Oh My Pi",
   "type": "module",
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "overrides": {
     "dompurify": "^3.4.13"
   },
@@ -14,8 +17,16 @@
     "typecheck": "npm run build --workspace @omp-builder/shared && npm run typecheck --workspaces --if-present",
     "test:security": "NODE_OPTIONS=--max-old-space-size=2560 npm run build && node tests/security-regression.mjs",
     "test:rpc": "npm run build --workspace @omp-builder/api && node tests/omp-rpc-smoke.mjs",
+    "test:milestone-a": "npm run build && node tests/milestone-a-problems-prefs.mjs",
+    "test:milestone-b": "npm run build && node tests/milestone-b-workspace.mjs",
     "admin:reset": "node scripts/reset-admin.mjs",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "test:milestone-c": "npm run build && node tests/milestone-c-versions.mjs",
+    "test:milestone-d": "npm run build && node tests/milestone-d-chat-sessions.mjs",
+    "test:milestone-d-b6": "npm run build && node tests/milestone-d-project-rules.mjs",
+    "test:milestone-d-b5": "npm run build && node tests/milestone-d-github-import.mjs",
+    "test:milestone-e-media": "npm run build && node tests/milestone-e-media.mjs",
+    "test:milestone-e-picker": "npm run build && node tests/milestone-e-picker.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

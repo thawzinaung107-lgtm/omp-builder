@@ -228,7 +228,7 @@ environment win). `.env` is mode **0600**; never print its values.
   `docs/MIGRATION-PHASE3.5-2.md`). The old DB is frozen at copy time —
   anything created after the migration exists only in the new DB.
 - Never delete the data directory during rollback. Migrations are
-  additive (`user_version` 3 as of Phase 3); there is no downgrade path
+  additive (`user_version` 4 as of Milestone C (v4 adds the checkpoints table)); there is no downgrade path
   — keep the previous release directory and the pre-migration DB backup.
 
 ## Production checklist (still open)
@@ -264,6 +264,7 @@ node tests/phase3-monaco.mjs   # 6 checks
 node tests/phase3-preview.mjs  # 12 checks (real containers)
 node tests/phase3-gateway.mjs  # 13 checks
 node tests/phase3-e2e.mjs      # 4 checks (real OMP run + real API restart)
+node tests/milestone-a-problems-prefs.mjs  # 23 checks (Milestone A: log parser, redaction, Fix prompt, studio prefs, problems endpoint, built bundles)
 # Browser probe — run from a machine WITH headless Chrome, NOT on the VPS:
 node tests/phase3-gateway-browser-probe.mjs  # 3 checks
 ```

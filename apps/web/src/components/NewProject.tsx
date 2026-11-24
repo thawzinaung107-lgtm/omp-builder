@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { ArrowLeft, ArrowRight, Check, GitBranch, LayoutTemplate, Paperclip, Sparkles, X } from "lucide-react";
-import type { Project, Provider } from "@omp-builder/shared";
+import { parseGitHubRepoUrl, type GitHubImportResult, type Project, type Provider } from "@omp-builder/shared";
 import { api } from "../api";
 import { Button, Field, inputClass } from "../ui";
 
@@ -20,6 +20,9 @@ export function NewProject({
   const [modeNote, setModeNote] = useState("");
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [repoUrl, setRepoUrl] = useState("");
+  const [importResult, setImportResult] = useState<GitHubImportResult | null>(null);
+  const [importedProject, setImportedProject] = useState<Project | null>(null);
   const [modelId, setModelId] = useState(() => localStorage.getItem("omp-builder-default-provider") ?? providers[0]?.id ?? "");
   const [attachNote, setAttachNote] = useState(false);
   const [error, setError] = useState("");
@@ -27,22 +30,45 @@ export function NewProject({
 
   const selectedProvider = providers.find((p) => p.id === modelId) ?? providers[0];
   const chooseMode = (next: Mode) => {
-    if (next === "ai") {
-      setMode(next);
-      setModeNote("");
+    if (next === "template") {
+      setModeNote("Templates arrive in a later milestone — Start with AI works now.");
       return;
     }
-    setModeNote(next === "template" ? "Templates arrive in a later milestone — Start with AI works now." : "Git import arrives in Phase 4 — Start with AI works now.");
+    setMode(next);
+    setModeNote("");
   };
   const changeModel = (value: string) => {
     setModelId(value);
     if (value) localStorage.setItem("omp-builder-default-provider", value);
   };
+  const continueToReview = () => {
+    if (!name.trim()) return;
+    if (mode === "git") {
+      try {
+        parseGitHubRepoUrl(repoUrl.trim());
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Invalid repository URL");
+        return;
+      }
+      setError("");
+      setStep(2);
+      return;
+    }
+    if (!prompt.trim()) return;
+    setStep(2);
+  };
+
   const start = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true);
     setError("");
     try {
+      if (mode === "git") {
+        const result = await api.importGitHubProject(name.trim(), repoUrl.trim());
+        setImportedProject(result.project);
+        setImportResult(result.import);
+        return;
+      }
       const result = await api.createProject(name.trim(), prompt.trim());
       onCreated(result.project);
     } catch (cause) {
@@ -65,7 +91,7 @@ export function NewProject({
       <span>
         <span className="flex items-center gap-2 text-sm font-semibold text-omp-ink">
           {title}
-          {id !== "ai" && <span className="rounded-full bg-black/[.05] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-omp-muted">Soon</span>}
+          {id === "template" && <span className="rounded-full bg-black/[.05] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-omp-muted">Soon</span>}
         </span>
         <span className="mt-0.5 block text-xs leading-5 text-omp-muted">{body}</span>
       </span>
@@ -142,6 +168,27 @@ export function NewProject({
                       </select>
                     </Field>
                   </div>
+                  {mode === "git" && (
+                    <>
+                      <Field label="GitHub repository URL">
+                        <input
+                          required
+                          value={repoUrl}
+                          onChange={(event) => setRepoUrl(event.target.value)}
+                          placeholder="https://github.com/octocat/Hello-World"
+                          className={inputClass}
+                        />
+                      </Field>
+                      <div role="status" className="rounded-omp border border-omp-border bg-white px-3.5 py-2.5 text-sm leading-6 text-omp-muted">
+                        Public repositories only — no sign-in, and never put a username, password or token in the URL. The import is a shallow
+                        clone (latest commit only); repositories over 500 MB are refused. Secret files (.env, *.pem, *.key) are removed from the
+                        workspace, and any AGENTS.md, CLAUDE.md or .omp/RULES.md in the repo is listed after import — the AI will honor those
+                        files on its next turn, so review them.
+                      </div>
+                    </>
+                  )}
+                  {mode !== "git" && (
+                    <>
                   <Field label="What would you like to build?">
                     <textarea
                       required
@@ -165,6 +212,8 @@ export function NewProject({
                     <div role="status" className="rounded-omp border border-omp-border bg-white px-3.5 py-2.5 text-sm text-omp-muted">
                       File attachments aren't supported yet — describe the files in your prompt instead.
                     </div>
+                  )}
+                    </>
                   )}
                   <div className="rounded-omp border border-omp-border bg-white p-4">
                     <div className="mb-2 text-sm font-medium text-omp-ink">AI provider &amp; model</div>
@@ -198,16 +247,77 @@ export function NewProject({
                     <Button variant="ghost" onClick={onCancel}>
                       Cancel
                     </Button>
-                    <Button onClick={() => name.trim() && prompt.trim() && setStep(2)} disabled={!name.trim() || !prompt.trim()}>
+                    <Button onClick={continueToReview} disabled={!name.trim() || (mode === "git" ? !repoUrl.trim() : !prompt.trim())}>
                       Continue <ArrowRight size={15} />
                     </Button>
                   </div>
                 </div>
               </>
+            ) : importResult && importedProject ? (
+              <>
+                <h1 className="text-2xl font-bold tracking-tight text-omp-ink">Import complete</h1>
+                <p className="mt-1.5 text-sm text-omp-muted">
+                  {importResult.owner}/{importResult.repo} imported — {importResult.filesImported} files from commit {importResult.headOid.slice(0, 7)}.
+                  Shallow clone: latest commit only, history preserved.
+                </p>
+                <div className="mt-6 grid gap-4 rounded-omp-lg border border-omp-border bg-white p-5">
+                  <div>
+                    <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">Repository</div>
+                    <div className="mt-1 text-sm text-omp-ink">{importResult.sourceUrl}</div>
+                  </div>
+                  <div>
+                    <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">Size</div>
+                    <div className="mt-1 text-sm text-omp-ink">
+                      {(importResult.sizeBytes / 1024 / 1024).toFixed(2)} MB of {(importResult.sizeLimitBytes / 1024 / 1024).toFixed(0)} MB limit
+                    </div>
+                  </div>
+                  {importResult.excludedSecrets.length > 0 && (
+                    <div>
+                      <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">Secret files removed</div>
+                      <ul className="mt-1 list-disc pl-5">
+                        {importResult.excludedSecrets.map((file) => (
+                          <li key={file} className="font-mono text-xs leading-5 text-omp-ink">{file}</li>
+                        ))}
+                      </ul>
+                      <p className="mt-1 text-xs leading-5 text-omp-muted">
+                        These may still exist in the preserved git history — rotate any exposed secret.
+                      </p>
+                    </div>
+                  )}
+                  {importResult.rulesFiles.length > 0 ? (
+                    <div>
+                      <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">AI rules found — review before your first turn</div>
+                      <ul className="mt-1 list-disc pl-5">
+                        {importResult.rulesFiles.map((file) => (
+                          <li key={file.path} className="font-mono text-xs leading-5 text-omp-ink">{file.path}</li>
+                        ))}
+                      </ul>
+                      <p className="mt-1 text-xs leading-5 text-omp-muted">
+                        The AI loads these files on its next turn. Check AGENTS.md / CLAUDE.md in the file explorer and .omp/RULES.md in the
+                        Rules tab before prompting.
+                      </p>
+                    </div>
+                  ) : (
+                    <div>
+                      <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">AI rules found</div>
+                      <p className="mt-1 text-sm text-omp-ink">None — no AGENTS.md, CLAUDE.md or .omp/RULES.md at the repository root.</p>
+                    </div>
+                  )}
+                </div>
+                <div className="mt-6 flex justify-end gap-2">
+                  <Button onClick={() => onCreated(importedProject)}>
+                    Open project <ArrowRight size={15} />
+                  </Button>
+                </div>
+              </>
             ) : (
               <form onSubmit={start}>
                 <h1 className="text-2xl font-bold tracking-tight text-omp-ink">Review and start building</h1>
-                <p className="mt-1.5 text-sm text-omp-muted">The prompt becomes the first OMP session instruction.</p>
+                {mode === "git" ? (
+                  <p className="mt-1.5 text-sm text-omp-muted">A shallow clone of the public repository — no credentials are sent or stored.</p>
+                ) : (
+                  <p className="mt-1.5 text-sm text-omp-muted">The prompt becomes the first OMP session instruction.</p>
+                )}
                 <div className="mt-6 grid gap-4 rounded-omp-lg border border-omp-border bg-white p-5">
                   <div>
                     <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">Project</div>
@@ -217,10 +327,17 @@ export function NewProject({
                     <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">Framework</div>
                     <div className="mt-1 text-sm text-omp-ink">React + TypeScript</div>
                   </div>
-                  <div>
-                    <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">Prompt</div>
-                    <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-omp-ink">{prompt}</p>
-                  </div>
+                  {mode === "git" ? (
+                    <div>
+                      <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">Repository</div>
+                      <div className="mt-1 text-sm text-omp-ink">{repoUrl.trim()}</div>
+                    </div>
+                  ) : (
+                    <div>
+                      <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">Prompt</div>
+                      <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-omp-ink">{prompt}</p>
+                    </div>
+                  )}
                   <div>
                     <div className="text-[11px] font-bold uppercase tracking-[0.12em] text-omp-muted">Model</div>
                     <div className="mt-1 text-sm text-omp-ink">
@@ -238,7 +355,7 @@ export function NewProject({
                     <ArrowLeft size={15} /> Back
                   </Button>
                   <Button type="submit" disabled={busy}>
-                    {busy ? "Creating…" : "Start building"} <Sparkles size={15} />
+                    {busy ? (mode === "git" ? "Importing…" : "Creating…") : mode === "git" ? "Import repository" : "Start building"} <Sparkles size={15} />
                   </Button>
                 </div>
               </form>

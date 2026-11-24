@@ -28,13 +28,26 @@ function countFiles(entries: FileTreeEntry[]): number {
 export function FileExplorer({
   projectId,
   changedFiles,
+  dirtyFiles = [],
   refreshToken,
   onSelectFile,
+  initialExpanded,
+  onExpandedChange,
 }: {
   projectId: string;
   changedFiles: string[];
+  /** Milestone B (A3) — paths with unsaved editor buffers; shown as an
+   * amber dot next to the file name. Coexists with the agent-"Modified"
+   * badge (a file can carry both). */
+  dirtyFiles?: string[];
   refreshToken: number;
   onSelectFile?: (path: string) => void;
+  /** Milestone A (A7) — folders to expand on first load, restored from
+   * per-project prefs. When absent, the first level expands as before. */
+  initialExpanded?: string[] | null;
+  /** Milestone A (A7) — reports the expanded set whenever it changes so
+   * the Builder can persist it. */
+  onExpandedChange?: (paths: string[]) => void;
 }) {
   const [tree, setTree] = useState<FileTreeEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -51,8 +64,24 @@ export function FileExplorer({
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const renameGuard = useRef<string | null>(null);
+  // Milestone A (A7): the restored expansion is a first-load seed only
+  // (captured in a ref so later prop updates can't re-seed the tree).
+  const initialExpandedRef = useRef(initialExpanded);
+  // Milestone A (A7): report expansion changes to the Builder for
+  // persistence. The last-reported join is tracked so the callback
+  // fires only on a real change (never a render loop: the Builder
+  // stores the value and passes a new array back as a prop).
+  const lastReportedExpanded = useRef<string>("");
+  useEffect(() => {
+    if (!onExpandedChange) return;
+    const key = [...expanded].sort().join("\n");
+    if (key === lastReportedExpanded.current) return;
+    lastReportedExpanded.current = key;
+    onExpandedChange([...expanded]);
+  }, [expanded, onExpandedChange]);
 
   const changedSet = useMemo(() => new Set(changedFiles), [changedFiles]);
+  const dirtySet = useMemo(() => new Set(dirtyFiles), [dirtyFiles]);
   const changedAncestors = useMemo(() => {
     const ancestors = new Set<string>();
     for (const file of changedFiles) {
@@ -70,6 +99,9 @@ export function FileExplorer({
       setTree(result.tree);
       setExpanded((current) => {
         if (current.size) return current;
+        // Milestone A (A7): restore the persisted expansion when the
+        // Builder has one; otherwise expand the first level as before.
+        if (initialExpandedRef.current && initialExpandedRef.current.length) return new Set(initialExpandedRef.current);
         // Expand the first level on first load so the tree is not empty-looking.
         return new Set(result.tree.filter((e) => e.type === "dir").map((e) => e.path));
       });
@@ -216,6 +248,9 @@ export function FileExplorer({
             >
               {isDir ? <Folder size={15} className="shrink-0 text-omp-brand" /> : <FileIcon size={15} className="shrink-0 text-omp-muted" />}
               <span className="min-w-0 truncate">{entry.name}</span>
+              {!isDir && dirtySet.has(entry.path) && (
+                <span title="Unsaved changes" className="h-2 w-2 shrink-0 rounded-full bg-[#e8a13a]" aria-label={`Unsaved changes in ${entry.name}`} />
+              )}
               {changed && (
                 <span title="Changed in this session" className="ml-auto flex shrink-0 items-center gap-1 text-[10px] font-bold uppercase tracking-wide text-[#9a6b12]">
                   <span className="h-2 w-2 rounded-full bg-[#e8a13a]" /> Modified

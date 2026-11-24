@@ -703,6 +703,24 @@ export class PreviewManager {
     return this.start(projectId, workspacePath);
   }
 
+  /**
+   * Milestone B (A5) — Rebuild: stop + clear the staging mirror + start.
+   * Clearing staging (instead of reusing the incremental mirror) forces
+   * Vite's startup scan to run again from scratch, so a build error
+   * introduced since the last start surfaces in the container logs —
+   * and therefore in the Problems tab — where a plain iframe Refresh
+   * would miss it (Vite only logs build errors at startup). The
+   * workspace itself is never touched; start() re-syncs staging from it.
+   * Sequential stop/clear/start: each step takes the per-project lock
+   * in turn, so no lock is ever held across steps (no deadlock).
+   */
+  async rebuild(projectId: string, workspacePath: string): Promise<PreviewState> {
+    await this.stop(projectId);
+    const staging = previewStagingDir(projectId, this.previewRoot);
+    await rm(staging, { recursive: true, force: true });
+    return this.start(projectId, workspacePath);
+  }
+
   /** Live status: reconciles the DB row against actual Podman state. */
   async getStatus(projectId: string): Promise<PreviewState | null> {
     const current = this.row(projectId);

@@ -130,12 +130,14 @@ const PREVIEW_FLAGS = [
 let throwawayId = null;
 const previewPorts = [];
 try {
-  // (0) Migration v3 applied and unauthenticated preview access rejected.
-  assert.equal(db.pragma("user_version", { simple: true }), 3, "user_version is not 3");
+  // (0) Migration v5 applied and unauthenticated preview access rejected.
+  // Milestone D (B2) bumped the schema to v5 (chat_sessions table).
+  assert.equal(db.pragma("user_version", { simple: true }), 5, "user_version is not 5");
   assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='preview_state'").get(), "preview_state table missing");
+  assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='checkpoints'").get(), "checkpoints table missing");
   const anon = await fetch(`${api}/api/projects/${PHASE2_ID}/preview/status`);
   assert.equal(anon.status, 401);
-  ok("migration v3 applied (preview_state table, user_version 3); unauthenticated preview status rejected (401)");
+  ok("migration v5 applied (preview_state + checkpoints tables, user_version 5); unauthenticated preview status rejected (401)");
 
   // (1) Phase 2 static fixture: start, serve, logs, status.
   const started = await call("POST", `/api/projects/${PHASE2_ID}/preview/start`);

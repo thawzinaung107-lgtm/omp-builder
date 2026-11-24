@@ -78,7 +78,11 @@ export class OmpRpcSession {
       chownSync(this.options.sessionDir, uid, gid);
       chownSync(this.options.cwd, uid, gid);
     }
-    const args = ["--mode", "rpc", "--no-ui", "--no-extensions", "--no-skills", "--no-rules", "--no-context-files", "--cwd", this.options.cwd, "--session-dir", this.options.sessionDir];
+    // Milestone D (B6) - project rules: OMP native context files are now
+    // enabled (AGENTS.md + .omp/RULES.md). The --no-rules and
+    // --no-context-files flags used to disable them; --no-skills and
+    // --no-extensions stay as-is.
+    const args = ["--mode", "rpc", "--no-ui", "--no-extensions", "--no-skills", "--cwd", this.options.cwd, "--session-dir", this.options.sessionDir];
     if (this.options.resume) args.push("--continue");
     if (this.options.provider && this.options.modelId) args.push("--model", `${this.options.provider}/${this.options.modelId}`);
     const childEnv = childEnvironment(this.options.env);
